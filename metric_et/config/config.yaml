@@ -1,0 +1,40 @@
+# METRIC ETa Pipeline Configuration File
+# This file contains default settings for the METRIC pipeline
+
+# Input/Output directories
+input_dir: data/
+output_dir: output/
+
+# Date range for processing
+date_range:
+  start: 2025-09-14
+  end: 2025-12-04
+
+# Processing parameters
+cloud_threshold: 30
+
+# Calibration settings
+calibration:
+  method: auto          # auto, hot-cold, manual
+  cold_etrf: 1.05       # Expected ETrF for cold pixel
+  hot_etrf: 0.05        # Expected ETrF for hot pixel
+
+# Output settings
+output:
+  format: GeoTIFF       # GeoTIFF, NetCDF
+  bands:
+    - ET_daily
+    - ETrF
+    - LE
+    - dT
+
+# Visualization settings
+visualization:
+  colormap: viridis
+  dpi: 300
+  show_plots: false
+
+# Logging settings
+logging:
+  level: INFO
+  file: metric_et.log

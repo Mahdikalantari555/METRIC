@@ -1,0 +1,2 @@
+[console_scripts]
+metric = metric_et.cli.interface:cli
