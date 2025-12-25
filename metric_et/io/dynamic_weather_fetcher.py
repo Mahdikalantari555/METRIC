@@ -34,7 +34,8 @@ class DynamicWeatherFetcher:
     ]
 
     DAILY_VARIABLES = [
-        "et0_fao_evapotranspiration"
+        "et0_fao_evapotranspiration",
+        "shortwave_radiation_sum"
     ]
 
     def __init__(self, grid_spacing_km: float = 9.0):
@@ -268,7 +269,7 @@ class DynamicWeatherFetcher:
         """
         result = {}
 
-        # For daily variables (ET0)
+        # For daily variables (ET0 and shortwave radiation sum)
         if 'daily' in data:
             daily_data = data['daily']
             if 'et0_fao_evapotranspiration' in daily_data:
@@ -276,6 +277,12 @@ class DynamicWeatherFetcher:
                 et0_values = daily_data['et0_fao_evapotranspiration']
                 if et0_values:
                     result['et0_fao_evapotranspiration'] = et0_values[0]
+            
+            if 'shortwave_radiation_sum' in daily_data:
+                # Daily shortwave radiation sum is for the whole day (MJ/m²/day)
+                sw_rad_sum_values = daily_data['shortwave_radiation_sum']
+                if sw_rad_sum_values:
+                    result['shortwave_radiation_sum'] = sw_rad_sum_values[0]
 
         # For hourly variables, extract at 10:30 local
         if 'hourly' in data:

@@ -355,24 +355,42 @@ class METRICPipeline:
                 logger.info("cold_pixel has no 'ts' attribute")
 
             # Calibrate dT relationship
-            # Convert daily ET0 to instantaneous ET0 at overpass time
+            # Convert daily ET0 to instantaneous ET0 at overpass time using METRIC energy ratios
             et0_daily = self.data.get("et0_fao_evapotranspiration")
-            sw_rad = self.data.get("shortwave_radiation")
+            rs_inst = self.data.get("Rs_down")  # Instantaneous shortwave radiation from radiation module
+            rs_daily = self.data.get("shortwave_radiation_sum")  # Daily shortwave radiation sum from Open-Meteo (MJ/m²/day)
 
-            if et0_daily is not None and sw_rad is not None:
-                # Use shortwave radiation to estimate instantaneous ET0
-                # ET0_inst ≈ ET0_daily * (Rs_inst / Rs_max), where Rs_max ≈ 1000 W/m²
-                # This gives spatially uniform instantaneous ET0
-                if hasattr(sw_rad, 'values'):
-                    sw_rad_scalar = float(np.nanmean(sw_rad.values))
+            if et0_daily is not None and rs_inst is not None and rs_daily is not None:
+                # METRIC approach: Use energy ratios directly
+                # Convert instantaneous radiation from W/m² to MJ/m²/hr: Rs_inst_MJ = Rs_inst_W * 0.0036
+                if hasattr(rs_inst, 'values'):
+                    rs_inst_scalar = float(np.nanmean(rs_inst.values))
                 else:
-                    sw_rad_scalar = float(np.nanmean(sw_rad))
-                et0_inst = (sw_rad_scalar / 1000.0) * et0_daily  /12.0 # Convert to mm/hr assuming 12 daylight hours
+                    rs_inst_scalar = float(np.nanmean(rs_inst))
+                
+                # Get daily radiation sum
+                if hasattr(rs_daily, 'values'):
+                    rs_daily_scalar = float(np.nanmean(rs_daily.values))
+                else:
+                    rs_daily_scalar = float(np.nanmean(rs_daily))
+                
+                # Convert instantaneous radiation to energy units (MJ/m²/hr)
+                rs_inst_mj = rs_inst_scalar * 0.0036
+                
+                # Calculate ET0_inst using METRIC energy ratio: ET0_inst = ET0_daily * (Rs_inst_MJ / Rs_daily_MJ)
+                # NO time division - the ratio already accounts for temporal scaling
+                rs_ratio = rs_inst_mj / rs_daily_scalar
+                et0_inst = et0_daily * rs_ratio
+                
+                logger.info(f"Rs_inst: {rs_inst_scalar:.2f} W/m² = {rs_inst_mj:.4f} MJ/m²/hr, Rs_daily: {rs_daily_scalar:.2f} MJ/m²/day, Ratio: {rs_ratio:.4f}")
             elif et0_daily is not None:
-                # Fallback: assume 12 daylight hours for conversion
-                et0_inst = et0_daily / 12.0
+                # METRIC-safe fallback: Use typical overpass fraction when radiation data missing
+                # Typical Landsat overpass represents ~15% of daily ET0
+                et0_inst = et0_daily * 0.15
+                logger.warning("Using METRIC fallback: ET0_inst = ET0_daily × 0.15 (radiation data missing)")
             else:
                 et0_inst = 0.65  # Default value
+                logger.warning("Using default ET0_inst = 0.65 mm/hr")
 
             # Extract scalar air temperature from weather data
             temp_2m = self.data.get("temperature_2m")
@@ -433,30 +451,48 @@ class METRICPipeline:
                                f"Mean={np.mean(valid_le):.2f}, Std={np.std(valid_le):.2f}, Unique={len(np.unique(valid_le))}")
 
             # Use the same instantaneous ETr calculation as in calibration
-            # Convert daily ET0 to instantaneous ETr at overpass time
+            # Convert daily ET0 to instantaneous ETr at overpass time using METRIC energy ratios
             et0_daily = self.data.get("et0_fao_evapotranspiration")
-            sw_rad = self.data.get("shortwave_radiation")
+            rs_inst = self.data.get("Rs_down")  # Instantaneous shortwave radiation from radiation module
+            rs_daily = self.data.get("shortwave_radiation_sum")  # Daily shortwave radiation sum from Open-Meteo (MJ/m²/day)
 
-            if et0_daily is not None and sw_rad is not None:
-                # Use shortwave radiation to estimate instantaneous ET0, then convert to ETr
-                if hasattr(sw_rad, 'values'):
-                    sw_rad_scalar = float(np.nanmean(sw_rad.values))
+            if et0_daily is not None and rs_inst is not None and rs_daily is not None:
+                # METRIC approach: Use energy ratios directly
+                # Convert instantaneous radiation from W/m² to MJ/m²/hr: Rs_inst_MJ = Rs_inst_W * 0.0036
+                if hasattr(rs_inst, 'values'):
+                    rs_inst_scalar = float(np.nanmean(rs_inst.values))
                 else:
-                    sw_rad_scalar = float(np.nanmean(sw_rad))
-                et0_inst = (sw_rad_scalar / 1000.0) * et0_daily /12.0 # Convert to mm/hr assuming 12 daylight hours
+                    rs_inst_scalar = float(np.nanmean(rs_inst))
+                
+                # Get daily radiation sum
+                if hasattr(rs_daily, 'values'):
+                    rs_daily_scalar = float(np.nanmean(rs_daily.values))
+                else:
+                    rs_daily_scalar = float(np.nanmean(rs_daily))
+                
+                # Convert instantaneous radiation to energy units (MJ/m²/hr)
+                rs_inst_mj = rs_inst_scalar * 0.0036
+                
+                # Calculate ET0_inst using METRIC energy ratio: ET0_inst = ET0_daily * (Rs_inst_MJ / Rs_daily_MJ)
+                # NO time division - the ratio already accounts for temporal scaling
+                rs_ratio = rs_inst_mj / rs_daily_scalar
+                et0_inst = et0_daily * rs_ratio
                 etr_inst = et0_inst * 1.15  # Convert to alfalfa reference ET
+                
                 # Get scalar values for logging
                 et0_inst_scalar = float(np.nanmean(et0_inst.values)) if hasattr(et0_inst, 'values') else float(np.nanmean(et0_inst))
                 etr_inst_scalar = float(np.nanmean(etr_inst.values)) if hasattr(etr_inst, 'values') else float(np.nanmean(etr_inst))
-                logger.info(f"DEBUG ET_calc - ETr_inst calculated as spatially uniform: {etr_inst_scalar:.6f} mm/hr (ET0_inst={et0_inst_scalar:.6f}, sw_rad_scalar={sw_rad_scalar:.2f})")
+                logger.info(f"DEBUG ET_calc - ETr_inst calculated with METRIC energy ratio: {etr_inst_scalar:.6f} mm/hr (ET0_inst={et0_inst_scalar:.6f}, Rs_ratio={rs_ratio:.4f})")
             elif et0_daily is not None:
-                # Fallback: assume 12 daylight hours for conversion
-                et0_inst = et0_daily / 12.0
+                # METRIC-safe fallback: Use typical overpass fraction when radiation data missing
+                # Typical Landsat overpass represents ~15% of daily ET0
+                et0_inst = et0_daily * 0.15
                 etr_inst = et0_inst * 1.15
+                
                 # Get scalar values for logging
                 et0_daily_scalar = float(np.nanmean(et0_daily.values)) if hasattr(et0_daily, 'values') else float(np.nanmean(et0_daily))
                 etr_inst_scalar = float(np.nanmean(etr_inst.values)) if hasattr(etr_inst, 'values') else float(np.nanmean(etr_inst))
-                logger.info(f"DEBUG ET_calc - ETr_inst calculated as spatially uniform (fallback): {etr_inst_scalar:.6f} mm/hr (ET0_daily={et0_daily_scalar:.6f})")
+                logger.info(f"DEBUG ET_calc - ETr_inst calculated with METRIC fallback: {etr_inst_scalar:.6f} mm/hr (ET0_daily={et0_daily_scalar:.6f} × 0.15)")
             else:
                 etr_inst = None
                 logger.warning("DEBUG ET_calc - No ET0 data available, ETr_inst = None")
