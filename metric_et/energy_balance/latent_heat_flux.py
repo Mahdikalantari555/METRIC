@@ -158,41 +158,38 @@ class LatentHeatFlux:
         H: np.ndarray
     ) -> np.ndarray:
         """
-        Apply energy balance constraints to LE.
-        
-        Physical constraints:
-        1. LE cannot exceed available energy (energy conservation)
-        2. LE should be non-negative (no condensation in METRIC)
-        3. LE cannot be more negative than available energy
-        
+        Apply energy balance constraints to LE based on configuration.
+
+        METRIC principle: LE is strictly residual, but constraints can be applied
+        based on use case (daytime vs. nocturnal, advection conditions).
+
         Args:
             le: Latent heat flux (W/m²)
             rn: Net radiation (W/m²)
             G: Soil heat flux (W/m²)
             H: Sensible heat flux (W/m²)
-            
+
         Returns:
             Constrained latent heat flux (W/m²)
         """
-        available_energy = rn - G
-        
+        # Apply constraints based on configuration
         if self.config.allow_negative_le:
-            # Allow negative LE (advection conditions)
-            # LE should be >= available energy (H <= 0)
-            # and LE <= available energy (H >= 0)
-            # This means LE can be negative only when H is positive
-            # and magnitude cannot exceed available energy
-            le = np.clip(le, available_energy, np.abs(available_energy) * 0.99)
+            # Allow negative LE for advection or nocturnal conditions
+            # Apply physical bounds
+            le = np.clip(le, self.config.min_le, self.config.max_le)
         else:
-            # Standard METRIC: LE >= 0
-            # When available energy > 0, LE is bounded between 0 and available_energy
-            # When available energy <= 0, LE = 0
+            # Standard METRIC daytime assumption: LE >= 0
+            le = np.maximum(le, 0.0)
+            
+            # Additional constraint: LE should not exceed available energy
+            # when available energy is positive
+            available_energy = rn - G
             le = np.where(
-                available_energy > 0,
-                np.clip(le, 0.0, available_energy),
-                0.0
+                (available_energy > 0) & (le > available_energy),
+                available_energy,
+                le
             )
-        
+
         return le
     
     def calculate_et_instantaneous(
@@ -215,11 +212,11 @@ class LatentHeatFlux:
             Instantaneous ET rate (mm/hr)
         """
         # W/m² = J/(s·m²)
-        # ET (mm/s) = LE (W/m²) / λ (J/kg) / 1000 (kg/m³ for mm conversion)
-        # ET (mm/hr) = LE / λ / 1000 * 3600
-        #            = LE * 3.6 / λ
+        # ET (mm/s) = LE (W/m²) / λ (J/kg)
+        # Since 1 kg/m² = 1 mm water, density cancels out
+        # ET (mm/hr) = LE * 3600 / λ
         
-        et_mm_hr = le * 3.6 / lambda_vaporization
+        et_mm_hr = le * 3600.0 / lambda_vaporization
         
         return et_mm_hr
     
@@ -249,9 +246,11 @@ class LatentHeatFlux:
         etrf = np.where(etr > 0, et_inst / etr, 0.0)
         etof = np.where(eto > 0, et_inst / eto, 0.0)
         
-        # Clip to reasonable range
-        etrf = np.clip(etrf, 0.0, 2.0)
-        etof = np.clip(etof, 0.0, 2.0)
+        # Clip to reasonable range based on configuration
+        # Allow higher values for stressed or irrigated conditions
+        max_et_fraction = max(self.config.max_ef * 2.0, 2.0)  # Scale based on max_ef
+        etrf = np.clip(etrf, 0.0, max_et_fraction)
+        etof = np.clip(etof, 0.0, max_et_fraction)
         
         return {
             'ET_inst': et_inst,
@@ -304,14 +303,22 @@ class LatentHeatFlux:
         )
         
         # Check for large residuals
-        quality = np.where(
+        # Improved scaling to prevent negative quality values
+        quality_reduction = np.where(
             np.abs(rel_residual) > 0.1,
-            1.0 - np.abs(rel_residual) * 5.0,
-            quality
+            np.minimum(np.abs(rel_residual) * 5.0, 1.0),  # Cap reduction at 1.0
+            0.0
         )
+        quality = np.maximum(quality - quality_reduction, 0.0)  # Ensure non-negative
         
-        # Clip quality
-        quality = np.clip(quality, 0.0, 1.0)
+        # Additional quality checks for energy balance violations
+        # LE should be between 0 and available_energy (when AE > 0) for standard cases
+        if not self.config.allow_negative_le:
+            quality = np.where(
+                (available_energy > 0) & ((le < 0) | (le > available_energy)),
+                0.0,
+                quality
+            )
         
         return {
             'quality_flag': quality,
@@ -329,13 +336,13 @@ class LatentHeatFlux:
         apply_constraints: bool = True
     ) -> Dict[str, np.ndarray]:
         """
-        Calculate latent heat flux and related parameters.
+        Calculate latent heat flux and related parameters with comprehensive validation.
         
         Args:
             rn: Net radiation array (W/m²)
             G: Soil heat flux array (W/m²)
             H: Sensible heat flux array (W/m²)
-            ts_kelvin: Surface temperature in Kelvin (optional, for quality check)
+            ts_kelvin: Surface temperature in Kelvin (optional, for stress indicators)
             apply_constraints: Whether to apply energy balance constraints
             
         Returns:
@@ -344,8 +351,12 @@ class LatentHeatFlux:
                 - 'available_energy': Rn - G (W/m²)
                 - 'EF': Evaporative fraction
                 - 'ET_inst': Instantaneous ET rate (mm/hr)
+                - 'stress_indicator': Optional stress indicator from surface temperature
+                
+        Raises:
+            ValueError: If input arrays have incompatible shapes or invalid units
         """
-        # Ensure arrays have same dtype
+        # Input validation
         def to_numpy(arr):
             if hasattr(arr, 'values'):
                 return np.asarray(arr.values, dtype=np.float64)
@@ -355,6 +366,16 @@ class LatentHeatFlux:
         rn = to_numpy(rn)
         G = to_numpy(G)
         H = to_numpy(H)
+        
+        # Validate input shapes
+        if not (rn.shape == G.shape == H.shape):
+            raise ValueError(f"Input arrays must have same shape. Got rn: {rn.shape}, G: {G.shape}, H: {H.shape}")
+        
+        # Validate units (basic checks)
+        if np.any(np.abs(rn) > 2000) or np.any(np.abs(G) > 500) or np.any(np.abs(H) > 2000):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("Potential unit mismatch: extreme values detected in input arrays")
         
         # Calculate LE as residual
         LE = self.calculate_le_residual(rn, G, H)
@@ -385,12 +406,26 @@ class LatentHeatFlux:
         # Apply physical bounds to EF
         EF = np.clip(EF, self.config.min_ef, self.config.max_ef)
         
-        return {
+        # Optional surface temperature analysis for stress indicators
+        stress_indicator = None
+        if ts_kelvin is not None:
+            ts_kelvin = to_numpy(ts_kelvin)
+            if ts_kelvin.shape == rn.shape:
+                # Calculate temperature-based stress indicator
+                # Higher temperatures with low EF may indicate water stress
+                stress_indicator = self._calculate_temperature_stress_indicator(LE, available_energy, ts_kelvin)
+        
+        result = {
             'LE': LE,
             'available_energy': available_energy,
             'EF': EF,
             'ET_inst': ET_inst
         }
+        
+        if stress_indicator is not None:
+            result['stress_indicator'] = stress_indicator
+            
+        return result
     
     def calculate_full(
         self,
@@ -472,6 +507,39 @@ class LatentHeatFlux:
         Convenience method to calculate latent heat flux.
         """
         return self.calculate(*args, **kwargs)
+    
+    def _calculate_temperature_stress_indicator(
+        self,
+        le: np.ndarray,
+        available_energy: np.ndarray,
+        ts_kelvin: np.ndarray
+    ) -> np.ndarray:
+        """
+        Calculate temperature-based stress indicator.
+        
+        High surface temperature combined with low evaporative fraction
+        may indicate water stress conditions.
+        
+        Args:
+            le: Latent heat flux (W/m²)
+            available_energy: Available energy (Rn - G) (W/m²)
+            ts_kelvin: Surface temperature (K)
+            
+        Returns:
+            Stress indicator (0.0 to 1.0, higher values indicate more stress)
+        """
+        # Calculate evaporative fraction
+        ef = self.calculate_ef(le, available_energy)
+        
+        # Normalize temperature (assume 280-320K range for typical conditions)
+        # Higher temperatures get higher stress values
+        temp_stress = np.clip((ts_kelvin - 290.0) / 30.0, 0.0, 1.0)
+        
+        # Combine temperature stress with low evaporative fraction
+        # Low EF with high temperature indicates stress
+        stress_indicator = temp_stress * (1.0 - np.clip(ef, 0.0, 1.0))
+        
+        return stress_indicator
 
 
 def create_latent_heat_flux(
@@ -481,16 +549,30 @@ def create_latent_heat_flux(
     **kwargs
 ) -> LatentHeatFlux:
     """
-    Factory function to create LatentHeatFlux instance.
+    Factory function to create LatentHeatFlux instance with enhanced configuration.
     
     Args:
-        allow_negative: Whether to allow negative LE (advection)
-        min_ef: Minimum evaporative fraction
-        max_ef: Maximum evaporative fraction
-        **kwargs: Additional configuration parameters
-        
+        allow_negative: Whether to allow negative LE (advection conditions)
+        min_ef: Minimum evaporative fraction (default: 0.0)
+        max_ef: Maximum evaporative fraction (default: 1.2, METRIC-compliant)
+        **kwargs: Additional configuration parameters including:
+            - min_le: Minimum LE value (W/m²) for negative LE cases
+            - max_le: Maximum LE value (W/m²)
+            - min_available_energy: Minimum available energy for EF calculation
+            - quality_threshold: Quality flag threshold
+            
     Returns:
         Configured LatentHeatFlux instance
+        
+    Examples:
+        >>> # Standard METRIC daytime conditions
+        >>> le_calculator = create_latent_heat_flux()
+        
+        >>> # Allow negative LE for advection studies
+        >>> le_calculator = create_latent_heat_flux(allow_negative=True, min_le=-200.0)
+        
+        >>> # Flexible ET fraction scaling for stressed conditions
+        >>> le_calculator = create_latent_heat_flux(max_ef=2.0)
     """
     config = LatentHeatFluxConfig(
         allow_negative_le=allow_negative,

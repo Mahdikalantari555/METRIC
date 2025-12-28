@@ -6,6 +6,7 @@ relationship used in the sensible heat flux computation for METRIC.
 """
 
 from typing import Dict, Optional, Tuple, Any
+import logging
 import numpy as np
 import xarray as xr
 from dataclasses import dataclass
@@ -21,7 +22,6 @@ class CalibrationResult:
     ts_cold: float  # Ts at cold pixel (K)
     ts_hot: float  # Ts at hot pixel (K)
     air_temperature: float  # Air temperature at 2m (K)
-    etr_inst: float  # Reference ET at satellite overpass (mm/hr)
     valid: bool  # Whether calibration succeeded
     errors: list  # List of validation errors
 
@@ -52,36 +52,25 @@ class DTCalibration:
     # Conversion factor from grass to alfalfa reference ET
     ETR_CONVERSION = 1.15  # ETr = ET0 * 1.15
 
-    def __init__(
-        self,
-        et0_inst: float
-    ):
+    def __init__(self):
         """
-        Initialize the DTCalibration with weather data.
+        Initialize the DTCalibration.
 
-        Args:
-            et0_inst: Instantaneous reference ET (grass) at satellite overpass (mm/hr)
+        METRIC calibration does not require instantaneous ET0 values.
         """
-        self.et0_inst = et0_inst
-        self.etr_inst = et0_inst * self.ETR_CONVERSION
+        pass
     
     @classmethod
-    def from_weather_data(
-        cls,
-        et0_inst: float
-    ) -> 'DTCalibration':
+    def create(cls) -> 'DTCalibration':
         """
-        Create DTCalibration from weather data.
+        Create DTCalibration instance.
 
-        Args:
-            et0_inst: Instantaneous reference ET at overpass (mm/hr)
+        METRIC calibration does not require weather data inputs.
 
         Returns:
             DTCalibration instance
         """
-        return cls(
-            et0_inst=et0_inst
-        )
+        return cls()
     
     def calibrate_dT(
         self,
@@ -254,7 +243,6 @@ class DTCalibration:
             ts_cold=ts_cold,
             ts_hot=ts_hot,
             air_temperature=air_temperature,
-            etr_inst=self.etr_inst,
             valid=valid,
             errors=errors
         )
@@ -299,13 +287,9 @@ class DTCalibration:
             "Ts_cold": float(result.ts_cold),
             "Ts_hot": float(result.ts_hot),
             "Ta": float(result.air_temperature),
-            "ETr_inst": float(result.etr_inst),
             "valid": result.valid,
             "errors": result.errors
         }
     
     def __repr__(self) -> str:
-        return (
-            f"DTCalibration(ET0_inst={self.et0_inst:.4f} mm/hr, "
-            f"ETr_inst={self.etr_inst:.4f} mm/hr)"
-        )
+        return "DTCalibration()"

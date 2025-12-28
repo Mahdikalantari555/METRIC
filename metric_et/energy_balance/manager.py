@@ -37,7 +37,7 @@ from metric_et.energy_balance.latent_heat_flux import (
 class EnergyBalanceConfig:
     """Configuration for the energy balance manager."""
     # G configuration
-    g_method: str = 'bastiaanssen'
+    g_method: str = 'document'
     g_ndvi_threshold: float = 0.2
     
     # H configuration
@@ -318,7 +318,7 @@ class EnergyBalanceManager:
 
 
 def create_energy_balance_manager(
-    g_method: str = 'bastaanssen',
+    g_method: str = 'document',
     h_use_stability: bool = True,
     dt_a: Optional[float] = None,
     dt_b: Optional[float] = None

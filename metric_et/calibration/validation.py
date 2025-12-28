@@ -70,9 +70,11 @@ class EnergyBalanceValidator:
     H_HOT_MAX = 0.80
     
     # Latent heat to ET conversion (W/m² to mm/hr)
-    # ET (mm/hr) = LE (W/m²) / (2.45e6 J/kg * 1000 kg/m³) * 3600 s/hr * 1000 mm/m
-    # Simplified: ET (mm/hr) = LE (W/m²) / 2452.7
-    LE_TO_ET_CONVERSION = 1 / 2452.7
+    # Correct physics: ET (mm/hr) = LE (W/m²) * 3600 (s/hr) / λ (J/kg)
+    # Where λ = 2.45e6 J/kg (latent heat of vaporization)
+    # Note: Water density cancels out since 1 kg/m² = 1 mm water depth
+    # Simplified: ET (mm/hr) = LE (W/m²) * 3600 / 2.45e6
+    LE_TO_ET_CONVERSION = 3600.0 / 2.45e6  # = 0.001469
     
     def __init__(
         self,

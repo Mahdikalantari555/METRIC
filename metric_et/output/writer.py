@@ -278,7 +278,6 @@ def write_metadata(
             'Ts_cold': float(calibration.ts_cold) if isinstance(calibration.ts_cold, (int, float, np.integer, np.floating)) else float(np.nanmean(calibration.ts_cold)) if hasattr(calibration.ts_cold, 'values') else float(calibration.ts_cold),
             'Ts_hot': float(calibration.ts_hot) if isinstance(calibration.ts_hot, (int, float, np.integer, np.floating)) else float(np.nanmean(calibration.ts_hot)) if hasattr(calibration.ts_hot, 'values') else float(calibration.ts_hot),
             'Ta': float(calibration.air_temperature) if isinstance(calibration.air_temperature, (int, float, np.integer, np.floating)) else float(np.nanmean(calibration.air_temperature)) if hasattr(calibration.air_temperature, 'values') else float(calibration.air_temperature),
-            'ETr_inst': float(calibration.etr_inst) if isinstance(calibration.etr_inst, (int, float, np.integer, np.floating)) else float(np.nanmean(calibration.etr_inst)) if hasattr(calibration.etr_inst, 'values') else float(calibration.etr_inst),
             'valid': calibration.valid,
             'errors': calibration.errors
         },

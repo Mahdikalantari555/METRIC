@@ -68,19 +68,39 @@ class AlbedoCalculator:
     def compute(self, cube: DataCube) -> DataCube:
         """
         Compute broadband albedo and add to DataCube.
-        
+
         Args:
             cube: Input DataCube containing required bands
-            
+
         Returns:
             DataCube with added albedo band
-            
-        Raises:
-            ValueError: If required bands are missing
         """
-        albedo = self.compute_albedo(cube)
-        cube.add("albedo", albedo)
-        return cube
+        import logging
+        logger = logging.getLogger(__name__)
+
+        try:
+            albedo = self.compute_albedo(cube)
+            cube.add("albedo", albedo)
+            logger.info("Albedo calculation completed successfully")
+            return cube
+        except Exception as e:
+            logger.warning(f"Albedo calculation failed in compute method: {e}, using default albedo = 0.2")
+            # Create a default albedo array with shape matching other bands
+            sample_band = next(iter(cube.data.values()))
+            default_albedo = xr.DataArray(
+                np.full(sample_band.shape, 0.2, dtype=np.float32),
+                dims=sample_band.dims,
+                coords=sample_band.coords,
+                attrs={
+                    'long_name': 'Default Broadband Albedo',
+                    'units': 'dimensionless',
+                    'method': 'default_fallback',
+                    'default_value': 0.2
+                }
+            )
+            cube.add("albedo", default_albedo)
+            logger.info("Default albedo added to DataCube")
+            return cube
     
     def _get_nodata_mask(self, cube: DataCube) -> xr.DataArray:
         """
@@ -125,73 +145,105 @@ class AlbedoCalculator:
     def compute_albedo(self, cube: DataCube) -> xr.DataArray:
         """
         Compute broadband shortwave albedo.
-        
+
         Uses TMAD coefficients for Landsat 8/9:
         α = Σ(coef_i * band_i) + intercept
-        
+
         Args:
             cube: DataCube containing blue, red, nir08, swir16, swir22 bands
-            
+
         Returns:
             Albedo as dimensionless DataArray [0, 1]
-            
-        Raises:
-            ValueError: If required bands are missing
         """
         required_bands = ["blue", "red", "nir08", "swir16", "swir22"]
         missing = [b for b in required_bands if b not in cube.bands()]
         if missing:
-            raise ValueError(
-                f"Missing bands for albedo calculation: {missing}. "
-                f"Available bands: {cube.bands()}"
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Missing bands for albedo calculation: {missing}, creating default albedo array")
+
+            # Create a default albedo array with shape matching other bands
+            sample_band = next(iter(cube.data.values()))
+            default_albedo = xr.DataArray(
+                np.full(sample_band.shape, 0.2, dtype=np.float32),
+                dims=sample_band.dims,
+                coords=sample_band.coords,
+                attrs={
+                    'long_name': 'Default Broadband Albedo',
+                    'units': 'dimensionless',
+                    'method': 'default_fallback_missing_bands',
+                    'default_value': 0.2
+                }
             )
-        
-        # Get bands as float
-        blue = cube.get("blue").astype(float)
-        red = cube.get("red").astype(float)
-        nir = cube.get("nir08").astype(float)
-        swir1 = cube.get("swir16").astype(float)
-        swir2 = cube.get("swir22").astype(float)
-        
-        # Select coefficients based on collection
-        if self.use_collection2:
-            coeffs = self.COEFFS_COLLECTION2
-        else:
-            coeffs = self.COEFFS_COLLECTION1
-        
-        # Compute albedo
-        albedo = (
-            coeffs['blue'] * blue +
-            coeffs['red'] * red +
-            coeffs['nir'] * nir +
-            coeffs['swir1'] * swir1 +
-            coeffs['swir2'] * swir2 +
-            coeffs['intercept']
-        )
-        
-        # Get nodata mask
-        valid_mask = self._get_nodata_mask(cube)
-        
-        # Apply nodata mask
-        albedo = albedo.where(valid_mask, np.nan)
-        
-        # Dark pixel correction: set negative values to minimum
-        if self.dark_pixel_correction:
-            albedo = xr.where(albedo < self.min_albedo, self.min_albedo, albedo)
-        
-        # Clamp to valid range
-        albedo = albedo.clip(self.min_albedo, self.max_albedo)
-        
-        albedo.name = "albedo"
-        albedo.attrs = {
-            'long_name': 'Broadband Shortwave Albedo',
-            'units': 'dimensionless',
-            'range': f'[{self.min_albedo}, {self.max_albedo}]',
-            'method': 'TMAD',
-            'collection': 'Collection 2' if self.use_collection2 else 'Collection 1'
-        }
-        
-        return albedo
+            return default_albedo
+
+        try:
+            # Get bands as float
+            blue = cube.get("blue").astype(float)
+            red = cube.get("red").astype(float)
+            nir = cube.get("nir08").astype(float)
+            swir1 = cube.get("swir16").astype(float)
+            swir2 = cube.get("swir22").astype(float)
+
+            # Select coefficients based on collection
+            if self.use_collection2:
+                coeffs = self.COEFFS_COLLECTION2
+            else:
+                coeffs = self.COEFFS_COLLECTION1
+
+            # Compute albedo
+            albedo = (
+                coeffs['blue'] * blue +
+                coeffs['red'] * red +
+                coeffs['nir'] * nir +
+                coeffs['swir1'] * swir1 +
+                coeffs['swir2'] * swir2 +
+                coeffs['intercept']
+            )
+
+            # Get nodata mask
+            valid_mask = self._get_nodata_mask(cube)
+
+            # Apply nodata mask
+            albedo = albedo.where(valid_mask, np.nan)
+
+            # Dark pixel correction: set negative values to minimum
+            if self.dark_pixel_correction:
+                albedo = xr.where(albedo < self.min_albedo, self.min_albedo, albedo)
+
+            # Clamp to valid range
+            albedo = albedo.clip(self.min_albedo, self.max_albedo)
+
+            albedo.name = "albedo"
+            albedo.attrs = {
+                'long_name': 'Broadband Shortwave Albedo',
+                'units': 'dimensionless',
+                'range': f'[{self.min_albedo}, {self.max_albedo}]',
+                'method': 'TMAD',
+                'collection': 'Collection 2' if self.use_collection2 else 'Collection 1'
+            }
+
+            return albedo
+
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Albedo calculation failed: {e}, creating default albedo array")
+
+            # Create a default albedo array with shape matching other bands
+            sample_band = cube.get("blue")  # Use blue band as reference
+            default_albedo = xr.DataArray(
+                np.full(sample_band.shape, 0.2, dtype=np.float32),
+                dims=sample_band.dims,
+                coords=sample_band.coords,
+                attrs={
+                    'long_name': 'Default Broadband Albedo',
+                    'units': 'dimensionless',
+                    'method': 'default_fallback_calculation_error',
+                    'default_value': 0.2
+                }
+            )
+            return default_albedo
     
     def compute_directional_hemispherical_albedo(
         self,

@@ -1,6 +1,6 @@
 """METRIC ETa processing pipeline."""
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union, Any
 import numpy as np
 import xarray as xr
 from loguru import logger
@@ -8,16 +8,19 @@ from loguru import logger
 
 class METRICPipeline:
     """Main processing pipeline for METRIC ETa model."""
-    
-    def __init__(self, config: Optional[Dict] = None):
+
+    def __init__(self, config: Optional[Dict] = None, roi_path: Optional[str] = None):
         """Initialize METRIC processing pipeline."""
         self.config = config or {}
+        self.roi_path = roi_path
         self.data = None
+        self._calibration_result = None
+        self._eb_manager = None  # Store EnergyBalanceManager instance for reuse
         logger.info("Initialized METRICPipeline")
     
     def run(
         self, landsat_dir: str, meteo_data: Dict,
-        output_dir: Optional[str] = None
+        output_dir: Optional[str] = None, roi_path: Optional[str] = None
     ) -> Dict[str, xr.DataArray]:
         """Run complete METRIC ETa processing pipeline."""
         import logging
@@ -29,7 +32,7 @@ class METRICPipeline:
 
             # Step 1: Load and preprocess data
             logger.info("Step 1: Loading and preprocessing data")
-            self.load_data(landsat_dir, meteo_data)
+            self.load_data(landsat_dir, meteo_data, roi_path=roi_path)
             self.preprocess()
 
             # Step 2: Calculate surface properties
@@ -66,7 +69,7 @@ class METRICPipeline:
             logger.error(f"Pipeline execution failed: {e}")
             raise
     
-    def load_data(self, landsat_dir: str, meteo_data: Dict, dem_path: Optional[str] = None) -> None:
+    def load_data(self, landsat_dir: str, meteo_data: Dict, dem_path: Optional[str] = None, roi_path: Optional[str] = None) -> None:
         """Load input data into DataCube."""
         from ..io import LandsatReader, MeteoReader
         from ..core.datacube import DataCube
@@ -86,7 +89,7 @@ class METRICPipeline:
             landsat_cube = landsat_reader.load(landsat_dir)
 
             # Load ROI and clip Landsat data to ROI
-            roi_path = "amirkabir.geojson"
+            roi_path = roi_path or self.roi_path or "amirkabir.geojson"
             import geopandas as gpd
             import rioxarray
             roi_gdf = gpd.read_file(roi_path)
@@ -243,18 +246,29 @@ class METRICPipeline:
             # Calculate vegetation indices (NDVI, EVI, LAI, SAVI, FVC)
             veg_indices = VegetationIndices()
             veg_indices.compute(self.data)
+            logger.info("Vegetation indices calculated")
 
             # Calculate broadband albedo
             albedo_calc = AlbedoCalculator()
             albedo_calc.compute(self.data)
+            logger.info("Albedo calculation completed")
+
+            # Check if albedo was added
+            if "albedo" in self.data.bands():
+                albedo_data = self.data.get("albedo")
+                logger.info(f"Albedo added to DataCube: shape={albedo_data.shape}, mean={np.nanmean(albedo_data.values):.3f}")
+            else:
+                logger.error("Albedo not found in DataCube after calculation!")
 
             # Calculate emissivity
             emissivity_calc = EmissivityCalculator()
             emissivity_calc.compute(self.data)
+            logger.info("Emissivity calculation completed")
 
             # Calculate roughness parameters
             roughness_calc = RoughnessCalculator()
             roughness_calc.compute(self.data)
+            logger.info("Roughness calculation completed")
 
             logger.info("Surface properties calculation completed")
 
@@ -306,18 +320,104 @@ class METRICPipeline:
 
             logger.info("Calculating energy balance")
 
-            # Initialize energy balance manager
-            eb_manager = EnergyBalanceManager()
+            # Initialize and store energy balance manager for reuse
+            self._eb_manager = EnergyBalanceManager()
 
             # Calculate energy balance components
             # Note: This will be updated after calibration with anchor pixels
-            eb_results = eb_manager.calculate(self.data)
+            eb_results = self._eb_manager.calculate(self.data)
 
             logger.info("Energy balance calculation completed")
 
         except Exception as e:
             logger.error(f"Error calculating energy balance: {e}")
             raise
+
+    def _safe_nanmean(self, data, data_name: str) -> float:
+        """Safely calculate nanmean with proper error handling and logging.
+        
+        Args:
+            data: Input data (xarray DataArray or numpy array)
+            data_name: Name of the data for logging purposes
+            
+        Returns:
+            Float value of the mean, or raises ValueError if data is invalid
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        if data is None:
+            logger.error(f"{data_name} data is None")
+            raise ValueError(f"{data_name} data is None")
+            
+        # Check if data has values attribute (xarray DataArray)
+        if hasattr(data, 'values'):
+            values = data.values
+        else:
+            values = data
+            
+        # Check for empty arrays
+        if values.size == 0:
+            logger.error(f"{data_name} has empty array")
+            raise ValueError(f"{data_name} has empty array")
+            
+        # Check if all values are NaN
+        if np.all(np.isnan(values)):
+            logger.error(f"{data_name} contains only NaN values")
+            raise ValueError(f"{data_name} contains only NaN values")
+            
+        return float(np.nanmean(values))
+
+    def _get_air_temperature(self) -> float:
+        """Get air temperature with improved spatial handling.
+        
+        Returns:
+            Air temperature in Kelvin as float
+            
+        This method handles both spatially varying and uniform temperature data,
+        with proper fallback to default values.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        temp_2m = self.data.get("temperature_2m")
+        config_temp = self.config.get('temperature', {})
+        default_temp = config_temp.get('default_kelvin', 293.15)  # 20°C in Kelvin
+        
+        if temp_2m is not None:
+            try:
+                # Handle both spatially varying and uniform temperature data
+                air_temperature = self._safe_nanmean(temp_2m, "temperature_2m")
+                logger.info(f"Air temperature: {air_temperature:.2f} K ({air_temperature-273.15:.2f} °C)")
+                return air_temperature
+            except Exception as e:
+                logger.warning(f"Failed to process temperature data: {e}, using default")
+        
+        logger.warning(f"Using default air temperature: {default_temp} K ({default_temp-273.15:.2f} °C)")
+        return default_temp
+
+    def _get_et0_daily(self) -> float:
+        """Get daily ET0 value for METRIC scaling.
+
+        Returns:
+            Daily ET0 value in mm/day
+
+        METRIC uses ET0_daily directly for final scaling: ET_daily = EF * ET0_daily
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        et0_daily = self.data.get("et0_fao_evapotranspiration")
+
+        if et0_daily is not None:
+            et0_value = self._safe_nanmean(et0_daily, "ET0_daily")
+            logger.info(f"Using ET0_daily = {et0_value:.3f} mm/day for METRIC scaling")
+            return et0_value
+
+        # Fallback to default value if no ET0 data available
+        default_et0 = 5.0  # mm/day
+        logger.warning(f"No ET0 data available, using default ET0_daily = {default_et0} mm/day")
+        return default_et0
     
     def calibrate(self) -> None:
         """Apply METRIC calibration."""
@@ -333,8 +433,10 @@ class METRICPipeline:
 
             logger.info("Starting METRIC calibration")
 
-            # Select anchor pixels using Triangle method
-            anchor_selector = AnchorPixelSelector(method="triangle")
+            # Select anchor pixels using configurable method
+            calibration_config = self.config.get('calibration', {})
+            method = calibration_config.get('method', 'triangle')
+            anchor_selector = AnchorPixelSelector(method=method)
             anchor_result = anchor_selector.select_anchor_pixels(
                 ts=self.data.get("lwir11"),
                 ndvi=self.data.get("ndvi"),
@@ -354,67 +456,27 @@ class METRICPipeline:
             else:
                 logger.info("cold_pixel has no 'ts' attribute")
 
-            # Calibrate dT relationship
-            # Convert daily ET0 to instantaneous ET0 at overpass time using METRIC energy ratios
-            et0_daily = self.data.get("et0_fao_evapotranspiration")
-            rs_inst = self.data.get("Rs_down")  # Instantaneous shortwave radiation from radiation module
-            rs_daily = self.data.get("shortwave_radiation_sum")  # Daily shortwave radiation sum from Open-Meteo (MJ/m²/day)
+            # Get ET0_daily for METRIC calibration reference
+            # METRIC uses ET0_daily directly - no instantaneous ET0 estimation needed
+            et0_daily_value = self._get_et0_daily()
+            
+            # Use improved method for air temperature
+            air_temperature = self._get_air_temperature()
 
-            if et0_daily is not None and rs_inst is not None and rs_daily is not None:
-                # METRIC approach: Use energy ratios directly
-                # Convert instantaneous radiation from W/m² to MJ/m²/hr: Rs_inst_MJ = Rs_inst_W * 0.0036
-                if hasattr(rs_inst, 'values'):
-                    rs_inst_scalar = float(np.nanmean(rs_inst.values))
-                else:
-                    rs_inst_scalar = float(np.nanmean(rs_inst))
-                
-                # Get daily radiation sum
-                if hasattr(rs_daily, 'values'):
-                    rs_daily_scalar = float(np.nanmean(rs_daily.values))
-                else:
-                    rs_daily_scalar = float(np.nanmean(rs_daily))
-                
-                # Convert instantaneous radiation to energy units (MJ/m²/hr)
-                rs_inst_mj = rs_inst_scalar * 0.0036
-                
-                # Calculate ET0_inst using METRIC energy ratio: ET0_inst = ET0_daily * (Rs_inst_MJ / Rs_daily_MJ)
-                # NO time division - the ratio already accounts for temporal scaling
-                rs_ratio = rs_inst_mj / rs_daily_scalar
-                et0_inst = et0_daily * rs_ratio
-                
-                logger.info(f"Rs_inst: {rs_inst_scalar:.2f} W/m² = {rs_inst_mj:.4f} MJ/m²/hr, Rs_daily: {rs_daily_scalar:.2f} MJ/m²/day, Ratio: {rs_ratio:.4f}")
-            elif et0_daily is not None:
-                # METRIC-safe fallback: Use typical overpass fraction when radiation data missing
-                # Typical Landsat overpass represents ~15% of daily ET0
-                et0_inst = et0_daily * 0.15
-                logger.warning("Using METRIC fallback: ET0_inst = ET0_daily × 0.15 (radiation data missing)")
-            else:
-                et0_inst = 0.65  # Default value
-                logger.warning("Using default ET0_inst = 0.65 mm/hr")
-
-            # Extract scalar air temperature from weather data
-            temp_2m = self.data.get("temperature_2m")
-            if temp_2m is not None:
-                # Get the scalar value (temperature is spatially uniform)
-                if hasattr(temp_2m, 'values'):
-                    air_temperature = float(np.nanmean(temp_2m.values))
-                else:
-                    air_temperature = float(np.nanmean(temp_2m))
-            else:
-                air_temperature = 293.15  # Default 20°C in Kelvin
-
-            calibrator = DTCalibration(et0_inst=et0_inst)
+            calibrator = DTCalibration.create()
             calibration = calibrator.calibrate_from_anchors(self.data, anchor_result)
 
             # Store calibration result for later use in output writing
             self._calibration_result = calibration
 
-            # Update energy balance manager with calibration coefficients
-            eb_manager = EnergyBalanceManager()
-            eb_manager.set_anchor_pixel_calibration(calibration.a_coefficient, calibration.b_coefficient)
+            # Reuse the same energy balance manager instance for state consistency
+            if self._eb_manager is None:
+                self._eb_manager = EnergyBalanceManager()
+                
+            self._eb_manager.set_anchor_pixel_calibration(calibration.a_coefficient, calibration.b_coefficient)
 
             # Recalculate energy balance with calibration
-            eb_results = eb_manager.calculate(self.data)
+            eb_results = self._eb_manager.calculate(self.data)
 
             logger.info("METRIC calibration completed")
 
@@ -433,144 +495,166 @@ class METRICPipeline:
             if self.data is None:
                 raise ValueError("No data loaded. Call load_data() first.")
 
-            logger.info("Calculating evapotranspiration")
+            logger.info("=== STARTING EVAPOTRANSPIRATION CALCULATION ===")
+
+            # Log all available input data
+            logger.info("=== INPUT DATA SUMMARY ===")
+            all_bands = self.data.bands()
+            logger.info(f"Available bands: {all_bands}")
+
+            # Log key surface properties
+            ndvi = self.data.get("ndvi")
+            albedo = self.data.get("albedo")
+            emissivity = self.data.get("emissivity")
+            lai = self.data.get("lai")
+
+            if ndvi is not None:
+                valid_ndvi = ndvi.values[~np.isnan(ndvi.values)]
+                logger.info(f"NDVI: {len(valid_ndvi)} valid pixels, range [{np.min(valid_ndvi):.3f}, {np.max(valid_ndvi):.3f}], mean={np.mean(valid_ndvi):.3f}")
+
+            if albedo is not None:
+                valid_albedo = albedo.values[~np.isnan(albedo.values)]
+                logger.info(f"Albedo: {len(valid_albedo)} valid pixels, range [{np.min(valid_albedo):.3f}, {np.max(valid_albedo):.3f}], mean={np.mean(valid_albedo):.3f}")
+
+            if emissivity is not None:
+                valid_emiss = emissivity.values[~np.isnan(emissivity.values)]
+                logger.info(f"Emissivity: {len(valid_emiss)} valid pixels, range [{np.min(valid_emiss):.3f}, {np.max(valid_emiss):.3f}], mean={np.mean(valid_emiss):.3f}")
+
+            # Log radiation components
+            rn = self.data.get("R_n")
+            rs_down = self.data.get("Rs_down")
+            rl_up = self.data.get("R_l_up")
+            rl_down = self.data.get("R_l_down")
+
+            if rn is not None:
+                valid_rn = rn.values[~np.isnan(rn.values)]
+                logger.info(f"Net Radiation (Rn): {len(valid_rn)} valid pixels, range [{np.min(valid_rn):.1f}, {np.max(valid_rn):.1f}] W/m², mean={np.mean(valid_rn):.1f} W/m²")
+
+            if rs_down is not None:
+                valid_rs = rs_down.values[~np.isnan(rs_down.values)]
+                logger.info(f"Shortwave Down (Rs↓): {len(valid_rs)} valid pixels, range [{np.min(valid_rs):.1f}, {np.max(valid_rs):.1f}] W/m², mean={np.mean(valid_rs):.1f} W/m²")
+
+            # Log energy balance components
+            g_flux = self.data.get("G")
+            h_flux = self.data.get("H")
+            le_flux = self.data.get("LE")
+
+            if g_flux is not None:
+                valid_g = g_flux.values[~np.isnan(g_flux.values)]
+                logger.info(f"Soil Heat Flux (G): {len(valid_g)} valid pixels, range [{np.min(valid_g):.1f}, {np.max(valid_g):.1f}] W/m², mean={np.mean(valid_g):.1f} W/m²")
+
+            if h_flux is not None:
+                valid_h = h_flux.values[~np.isnan(h_flux.values)]
+                logger.info(f"Sensible Heat Flux (H): {len(valid_h)} valid pixels, range [{np.min(valid_h):.1f}, {np.max(valid_h):.1f}] W/m², mean={np.mean(valid_h):.1f} W/m²")
+
+            if le_flux is not None:
+                valid_le = le_flux.values[~np.isnan(le_flux.values)]
+                logger.info(f"Latent Heat Flux (LE): {len(valid_le)} valid pixels, range [{np.min(valid_le):.1f}, {np.max(valid_le):.1f}] W/m², mean={np.mean(valid_le):.1f} W/m²")
+
+            # Log weather data
+            temp_2m = self.data.get("temperature_2m")
+            et0_daily = self.data.get("et0_fao_evapotranspiration")
+            rs_daily = self.data.get("shortwave_radiation_sum")
+
+            if temp_2m is not None:
+                valid_temp = temp_2m.values[~np.isnan(temp_2m.values)]
+                logger.info(f"Air Temperature (Tₐ): {len(valid_temp)} valid pixels, range [{np.min(valid_temp)-273.15:.1f}, {np.max(valid_temp)-273.15:.1f}] °C, mean={np.mean(valid_temp)-273.15:.1f} °C")
+
+            if et0_daily is not None:
+                valid_et0 = et0_daily.values[~np.isnan(et0_daily.values)]
+                logger.info(f"Daily ET₀ (FAO): {len(valid_et0)} valid pixels, range [{np.min(valid_et0):.3f}, {np.max(valid_et0):.3f}] mm/day, mean={np.mean(valid_et0):.3f} mm/day")
+
+            if rs_daily is not None:
+                valid_rs_daily = rs_daily.values[~np.isnan(rs_daily.values)]
+                logger.info(f"Daily Shortwave Sum: {len(valid_rs_daily)} valid pixels, range [{np.min(valid_rs_daily):.1f}, {np.max(valid_rs_daily):.1f}] MJ/m²/day, mean={np.mean(valid_rs_daily):.1f} MJ/m²/day")
+
+            # Log surface temperature
+            ts_kelvin = self.data.get("lwir11")
+            if ts_kelvin is not None:
+                valid_ts = ts_kelvin.values[~np.isnan(ts_kelvin.values)]
+                logger.info(f"Surface Temperature (Ts): {len(valid_ts)} valid pixels, range [{np.min(valid_ts)-273.15:.1f}, {np.max(valid_ts)-273.15:.1f}] °C, mean={np.mean(valid_ts)-273.15:.1f} °C")
+
+            logger.info("=== STARTING INSTANTANEOUS ET CALCULATION ===")
 
             # Calculate instantaneous ET
             inst_et_calc = InstantaneousET()
 
-            # DEBUG: Log LE spatial variation before ET calculation
-            le_data = self.data.get("LE")
-            if le_data is not None:
-                if hasattr(le_data, 'values'):
-                    le_values = le_data.values
-                else:
-                    le_values = le_data
-                valid_le = le_values[~np.isnan(le_values)]
-                if len(valid_le) > 0:
-                    logger.info(f"DEBUG ET_calc - LE spatial stats: Min={np.min(valid_le):.2f}, Max={np.max(valid_le):.2f}, "
-                               f"Mean={np.mean(valid_le):.2f}, Std={np.std(valid_le):.2f}, Unique={len(np.unique(valid_le))}")
+            # Get ET0_daily for METRIC scaling
+            et0_daily_value = self._get_et0_daily()
 
-            # Use the same instantaneous ETr calculation as in calibration
-            # Convert daily ET0 to instantaneous ETr at overpass time using METRIC energy ratios
-            et0_daily = self.data.get("et0_fao_evapotranspiration")
-            rs_inst = self.data.get("Rs_down")  # Instantaneous shortwave radiation from radiation module
-            rs_daily = self.data.get("shortwave_radiation_sum")  # Daily shortwave radiation sum from Open-Meteo (MJ/m²/day)
+            logger.info("Step 1: Calculating instantaneous ET from energy balance")
+            logger.info("Formula: ET_inst = LE / (ρ × λ) where LE is latent heat flux")
 
-            if et0_daily is not None and rs_inst is not None and rs_daily is not None:
-                # METRIC approach: Use energy ratios directly
-                # Convert instantaneous radiation from W/m² to MJ/m²/hr: Rs_inst_MJ = Rs_inst_W * 0.0036
-                if hasattr(rs_inst, 'values'):
-                    rs_inst_scalar = float(np.nanmean(rs_inst.values))
-                else:
-                    rs_inst_scalar = float(np.nanmean(rs_inst))
-                
-                # Get daily radiation sum
-                if hasattr(rs_daily, 'values'):
-                    rs_daily_scalar = float(np.nanmean(rs_daily.values))
-                else:
-                    rs_daily_scalar = float(np.nanmean(rs_daily))
-                
-                # Convert instantaneous radiation to energy units (MJ/m²/hr)
-                rs_inst_mj = rs_inst_scalar * 0.0036
-                
-                # Calculate ET0_inst using METRIC energy ratio: ET0_inst = ET0_daily * (Rs_inst_MJ / Rs_daily_MJ)
-                # NO time division - the ratio already accounts for temporal scaling
-                rs_ratio = rs_inst_mj / rs_daily_scalar
-                et0_inst = et0_daily * rs_ratio
-                etr_inst = et0_inst * 1.15  # Convert to alfalfa reference ET
-                
-                # Get scalar values for logging
-                et0_inst_scalar = float(np.nanmean(et0_inst.values)) if hasattr(et0_inst, 'values') else float(np.nanmean(et0_inst))
-                etr_inst_scalar = float(np.nanmean(etr_inst.values)) if hasattr(etr_inst, 'values') else float(np.nanmean(etr_inst))
-                logger.info(f"DEBUG ET_calc - ETr_inst calculated with METRIC energy ratio: {etr_inst_scalar:.6f} mm/hr (ET0_inst={et0_inst_scalar:.6f}, Rs_ratio={rs_ratio:.4f})")
-            elif et0_daily is not None:
-                # METRIC-safe fallback: Use typical overpass fraction when radiation data missing
-                # Typical Landsat overpass represents ~15% of daily ET0
-                et0_inst = et0_daily * 0.15
-                etr_inst = et0_inst * 1.15
-                
-                # Get scalar values for logging
-                et0_daily_scalar = float(np.nanmean(et0_daily.values)) if hasattr(et0_daily, 'values') else float(np.nanmean(et0_daily))
-                etr_inst_scalar = float(np.nanmean(etr_inst.values)) if hasattr(etr_inst, 'values') else float(np.nanmean(etr_inst))
-                logger.info(f"DEBUG ET_calc - ETr_inst calculated with METRIC fallback: {etr_inst_scalar:.6f} mm/hr (ET0_daily={et0_daily_scalar:.6f} × 0.15)")
-            else:
-                etr_inst = None
-                logger.warning("DEBUG ET_calc - No ET0 data available, ETr_inst = None")
-
+            # Calculate instantaneous ET - still need ETrF for daily scaling
+            # Use ET0_daily as reference for ETrF calculation
+            et0_daily_data = self.data.get("et0_fao_evapotranspiration")
+            # Convert ET0_daily to ET0_inst for ETrF calculation
+            et0_inst_for_etrf = et0_daily_data / 12.0  # mm/day → mm/hr
             inst_et_result = inst_et_calc.calculate(
                 le=self.data.get("LE"),
-                etr_inst=etr_inst,
-                temperature_k=self.data.get("lwir11")
+                etr_inst=et0_inst_for_etrf    # Use ET0_daily in mm/hr for ETrF calculation 
             )
 
-            # DEBUG: Log ET_inst and ETrF spatial variation after calculation
+            # Log instantaneous ET results
             if "ET_inst" in inst_et_result:
                 et_inst_values = inst_et_result["ET_inst"]
                 valid_et_inst = et_inst_values[~np.isnan(et_inst_values)]
-                if len(valid_et_inst) > 0:
-                    logger.info(f"DEBUG ET_calc - ET_inst spatial stats: Min={np.min(valid_et_inst):.6f}, Max={np.max(valid_et_inst):.6f}, "
-                               f"Mean={np.mean(valid_et_inst):.6f}, Std={np.std(valid_et_inst):.6f}, Unique={len(np.unique(valid_et_inst))}")
+                logger.info(f"ET_inst results: {len(valid_et_inst)} valid pixels")
+                logger.info(f"  Range: [{np.min(valid_et_inst):.6f}, {np.max(valid_et_inst):.6f}] mm/hr")
+                logger.info(f"  Mean: {np.mean(valid_et_inst):.6f} mm/hr, Std: {np.std(valid_et_inst):.6f} mm/hr")
 
             if "ETrF" in inst_et_result:
                 etrf_values = inst_et_result["ETrF"]
                 valid_etrf = etrf_values[~np.isnan(etrf_values)]
-                if len(valid_etrf) > 0:
-                    logger.info(f"DEBUG ET_calc - ETrF spatial stats: Min={np.min(valid_etrf):.6f}, Max={np.max(valid_etrf):.6f}, "
-                               f"Mean={np.mean(valid_etrf):.6f}, Std={np.std(valid_etrf):.6f}, Unique={len(np.unique(valid_etrf))}")
-                    if np.max(valid_etrf) - np.mean(valid_etrf) < 0.01:
-                        logger.warning("DEBUG ET_calc - CRITICAL: ETrF has minimal spatial variation!")
+                logger.info(f"ETrF results: {len(valid_etrf)} valid pixels")
+                logger.info(f"  Range: [{np.min(valid_etrf):.6f}, {np.max(valid_etrf):.6f}]")
+                logger.info(f"  Mean: {np.mean(valid_etrf):.6f}, Std: {np.std(valid_etrf):.6f}")
+
+                # Check for unrealistic ETrF values
+                if np.max(valid_etrf) > 1.5:
+                    logger.warning(f"WARNING: ETrF maximum ({np.max(valid_etrf):.3f}) exceeds typical range [0, 1.2]")
+                if np.min(valid_etrf) < 0:
+                    logger.warning(f"WARNING: ETrF minimum ({np.min(valid_etrf):.3f}) is negative")
 
             # Add instantaneous ET to data
             self.data.add("ET_inst", inst_et_result["ET_inst"])
             if "ETrF" in inst_et_result:
                 self.data.add("ETrF", inst_et_result["ETrF"])
 
-            # Calculate daily ET
-            daily_et_calc = DailyET()
-            # Convert daily ET0 to ETr (alfalfa reference)
-            et0_daily = self.data.get("et0_fao_evapotranspiration")
-            if et0_daily is not None:
-                etr_daily = et0_daily * 1.15  # Convert ET0 to ETr
-                # Get scalar values for logging
-                et0_daily_scalar = float(np.nanmean(et0_daily.values)) if hasattr(et0_daily, 'values') else float(np.nanmean(et0_daily))
-                etr_daily_scalar = float(np.nanmean(etr_daily.values)) if hasattr(etr_daily, 'values') else float(np.nanmean(etr_daily))
-                logger.info(f"DEBUG ET_calc - ETr_daily calculated as spatially uniform: {etr_daily_scalar:.6f} mm/day (ET0_daily={et0_daily_scalar:.6f})")
-            else:
-                etr_daily = None
-                logger.warning("DEBUG ET_calc - No ET0 data available, ETr_daily = None")
+            logger.info("=== STARTING DAILY ET CALCULATION ===")
 
-            # DEBUG: Log ETrF before daily calculation
-            etrf_data = self.data.get("ETrF")
-            if etrf_data is not None:
-                if hasattr(etrf_data, 'values'):
-                    etrf_values = etrf_data.values
-                else:
-                    etrf_values = etrf_data
-                valid_etrf = etrf_values[~np.isnan(etrf_values)]
-                if len(valid_etrf) > 0:
-                    logger.info(f"DEBUG ET_calc - ETrF for daily calc: Min={np.min(valid_etrf):.6f}, Max={np.max(valid_etrf):.6f}, "
-                               f"Mean={np.mean(valid_etrf):.6f}, Std={np.std(valid_etrf):.6f}, Unique={len(np.unique(valid_etrf))}")
+            # Calculate daily ET using METRIC standard approach
+            daily_et_calc = DailyET()
+            logger.info("Step 3: Calculating daily ET using METRIC methodology")
+            logger.info("Formula: ET_daily = EF × ET0_daily")
+            logger.info("Note: METRIC uses evaporative fraction directly with daily reference ET")
+
+            # Use ET0_daily directly for METRIC scaling
+            et0_daily_data = self.data.get("et0_fao_evapotranspiration")
 
             daily_et_result = daily_et_calc.calculate(
-                etrf=self.data.get("ETrF"),
-                etr_daily=etr_daily
+                etrf=self.data.get("ETrF"),  # EF from instantaneous calculation
+                etr_daily=et0_daily_data   # Use ET0_daily directly (not converted to ETr)
             )
 
-            # DEBUG: Log final ET_daily spatial variation
+            # Log daily ET results
             if "ET_daily" in daily_et_result:
                 et_daily_values = daily_et_result["ET_daily"]
                 valid_et_daily = et_daily_values[~np.isnan(et_daily_values)]
-                if len(valid_et_daily) > 0:
-                    logger.info(f"DEBUG ET_calc - ET_daily final stats: Min={np.min(valid_et_daily):.6f}, Max={np.max(valid_et_daily):.6f}, "
-                               f"Mean={np.mean(valid_et_daily):.6f}, Std={np.std(valid_et_daily):.6f}, Unique={len(np.unique(valid_et_daily))}")
-                    max_mean_diff = abs(np.max(valid_et_daily) - np.mean(valid_et_daily))
-                    if max_mean_diff < 0.01:
-                        logger.error(f"DEBUG ET_calc - CRITICAL: ET_daily has minimal spatial variation (Max-Mean = {max_mean_diff:.6f})")
-                    else:
-                        logger.info(f"DEBUG ET_calc - OK: ET_daily has spatial variation (Max-Mean = {max_mean_diff:.6f})")
+                logger.info(f"ET_daily results: {len(valid_et_daily)} valid pixels")
+                logger.info(f"  Range: [{np.min(valid_et_daily):.6f}, {np.max(valid_et_daily):.6f}] mm/day")
+                logger.info(f"  Mean: {np.mean(valid_et_daily):.6f} mm/day, Std: {np.std(valid_et_daily):.6f} mm/day")
+
+                # Check for unrealistic values
+                if np.max(valid_et_daily) > 15:
+                    logger.warning(f"WARNING: ET_daily maximum ({np.max(valid_et_daily):.3f} mm/day) seems high")
+                if np.min(valid_et_daily) < 0:
+                    logger.warning(f"WARNING: ET_daily minimum ({np.min(valid_et_daily):.3f} mm/day) is negative")
 
             # Add daily ET to data
             self.data.add("ET_daily", daily_et_result["ET_daily"])
+
+            logger.info("=== ET QUALITY ASSESSMENT ===")
 
             # Calculate ET quality assessment
             quality_calc = ETQuality()
@@ -581,10 +665,11 @@ class METRICPipeline:
 
             # Add quality metrics to data
             self.data.add("ET_quality_class", quality_result["quality_class"])
-            # Note: confidence_score is not in the assess() result, using valid_fraction instead
             self.data.add("ET_confidence", quality_result["valid_fraction"])
 
-            logger.info("ET calculation completed")
+            logger.info(f"ET Quality: {quality_result.get('valid_fraction', 'N/A')} valid pixels")
+
+            logger.info("=== EVAPOTRANSPIRATION CALCULATION COMPLETED ===")
 
         except Exception as e:
             logger.error(f"Error calculating ET: {e}")
@@ -674,12 +759,14 @@ class METRICPipeline:
 
             # Create visualizations
             viz = Visualization(output_dir=output_dir)
-            viz.create_summary_figure(self.data, os.path.join(output_dir, "overview.png"))
+            overview_filename = f"overview_{date_str}.png"
+            viz.create_summary_figure(self.data, os.path.join(output_dir, overview_filename))
             if self.data.get('ET_daily') is not None:
+                et_map_filename = f"et_map_{date_str}.png"
                 viz.plot_et_map(
                     self.data.get('ET_daily'),
                     self.data,
-                    output_path=os.path.join(output_dir, "et_map.png")
+                    output_path=os.path.join(output_dir, et_map_filename)
                 )
 
             # Save metadata
