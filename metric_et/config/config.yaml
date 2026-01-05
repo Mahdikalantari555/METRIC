@@ -5,10 +5,10 @@
 input_dir: data/
 output_dir: output/
 
-# Date range for processing
-date_range:
-  start: 2025-09-14
-  end: 2025-12-04
+# Date range for processing (not used in pipeline, dates from scene metadata)
+# date_range:
+#   start: 2025-09-14
+#   end: 2025-12-04
 
 # Processing parameters
 cloud_threshold: 30

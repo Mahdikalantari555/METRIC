@@ -39,25 +39,29 @@ class METRICPipeline:
             logger.info("Step 2: Calculating surface properties")
             self.calculate_surface_properties()
 
-            # Step 3: Calculate radiation balance
+            # Step 3: Calculate radiation balance (Rn)
             logger.info("Step 3: Calculating radiation balance")
             self.calculate_radiation_balance()
 
-            # Step 4: Calculate initial energy balance (before calibration)
-            logger.info("Step 4: Calculating initial energy balance")
-            self.calculate_energy_balance()
+            # Step 4: Calculate soil heat flux (G) - calibration-free
+            logger.info("Step 4: Calculating soil heat flux")
+            self.calculate_soil_heat_flux()
 
-            # Step 5: Apply METRIC calibration
+            # Step 5: Apply METRIC calibration (needs Rn-G for anchor selection)
             logger.info("Step 5: Applying METRIC calibration")
             self.calibrate()
 
-            # Step 6: Calculate final ET
-            logger.info("Step 6: Calculating evapotranspiration")
+            # Step 6: Calculate final energy balance (H, LE) with calibration
+            logger.info("Step 6: Calculating energy balance with calibration")
+            self.calculate_energy_balance()
+
+            # Step 7: Calculate final ET
+            logger.info("Step 7: Calculating evapotranspiration")
             self.calculate_et()
 
-            # Step 7: Save results if output directory provided
+            # Step 8: Save results if output directory provided
             if output_dir:
-                logger.info("Step 7: Saving results")
+                logger.info("Step 8: Saving results")
                 self.save_results(output_dir)
 
             logger.info("METRIC ETa processing pipeline completed successfully")
@@ -232,7 +236,7 @@ class METRICPipeline:
     
     def calculate_surface_properties(self) -> None:
         """Calculate surface properties."""
-        from ..surface import VegetationIndices, AlbedoCalculator, EmissivityCalculator, RoughnessCalculator
+        from ..surface import VegetationIndices, AlbedoCalculator, EmissivityCalculator, RoughnessCalculator, LSTCalculator
         import logging
 
         logger = logging.getLogger(__name__)
@@ -264,6 +268,11 @@ class METRICPipeline:
             emissivity_calc = EmissivityCalculator()
             emissivity_calc.compute(self.data)
             logger.info("Emissivity calculation completed")
+
+            # Calculate land surface temperature (LST)
+            lst_calc = LSTCalculator()
+            lst_calc.compute(self.data)
+            logger.info("LST calculation completed")
 
             # Calculate roughness parameters
             roughness_calc = RoughnessCalculator()
@@ -307,8 +316,85 @@ class METRICPipeline:
             logger.error(f"Error calculating radiation balance: {e}")
             raise
     
+    def calculate_soil_heat_flux(self) -> None:
+        """Calculate soil heat flux (G) independently of calibration.
+        
+        G depends only on:
+        - Net radiation (Rn)
+        - NDVI or LAI
+        - Surface temperature (Ts)
+        
+        This method computes G BEFORE calibration so it can be used
+        for anchor pixel selection (Rn-G optimization).
+        """
+        from ..energy_balance import SoilHeatFlux, SoilHeatFluxConfig
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        try:
+            if self.data is None:
+                raise ValueError("No data loaded. Call load_data() first.")
+
+            logger.info("Calculating soil heat flux (calibration-free)")
+
+            # Check if Rn is available
+            rn = self.data.get("R_n")
+            if rn is None:
+                raise ValueError("Net radiation (R_n) not found. Calculate radiation balance first.")
+
+            # Get required inputs
+            ndvi = self.data.get("ndvi")
+            ts_kelvin = self.data.get("lst")
+            ta_kelvin = self.data.get("temperature_2m")
+
+            if ts_kelvin is None:
+                raise ValueError("Surface temperature (lst) not found")
+            if ta_kelvin is None:
+                raise ValueError("Air temperature (temperature_2m) not found")
+
+            # Initialize soil heat flux calculator
+            g_config = SoilHeatFluxConfig(method="automatic")
+            g_calculator = SoilHeatFlux(g_config)
+
+            # Calculate G
+            logger.info("Computing soil heat flux using Rn, NDVI, Ts, Ta")
+            g_result = g_calculator.calculate(
+                rn=rn.values,
+                ndvi=ndvi.values if ndvi is not None else None,
+                ts_kelvin=ts_kelvin.values,
+                ta_kelvin=ta_kelvin.values
+            )
+
+            # Add G to data cube
+            self.data.add("G", g_result['G'])
+
+            # Log statistics
+            g_values = g_result['G']
+            valid_g = g_values[~np.isnan(g_values)]
+            logger.info(f"Soil heat flux calculated: {len(valid_g)} valid pixels")
+            logger.info(f"  Range: [{np.min(valid_g):.1f}, {np.max(valid_g):.1f}] W/m²")
+            logger.info(f"  Mean: {np.mean(valid_g):.1f} W/m², Std: {np.std(valid_g):.1f} W/m²")
+
+            # Energy balance check: G should be 10-30% of Rn
+            if 'G_Rn_ratio' in g_result:
+                ratio = g_result['G_Rn_ratio']
+                valid_ratio = ratio[~np.isnan(ratio)]
+                if len(valid_ratio) > 0:
+                    logger.info(f"  G/Rn ratio: mean={np.mean(valid_ratio):.3f}, range=[{np.min(valid_ratio):.3f}, {np.max(valid_ratio):.3f}]")
+
+            logger.info("Soil heat flux calculation completed")
+
+        except Exception as e:
+            logger.error(f"Error calculating soil heat flux: {e}")
+            raise
+    
     def calculate_energy_balance(self) -> None:
-        """Calculate energy balance components."""
+        """Calculate energy balance components (H and LE) with calibration.
+        
+        Assumes Rn and G are already computed.
+        Uses anchor pixel calibration from METRIC to compute H and LE.
+        """
         from ..energy_balance import EnergyBalanceManager
         import logging
 
@@ -318,13 +404,23 @@ class METRICPipeline:
             if self.data is None:
                 raise ValueError("No data loaded. Call load_data() first.")
 
-            logger.info("Calculating energy balance")
+            logger.info("Calculating energy balance (H and LE with calibration)")
 
-            # Initialize and store energy balance manager for reuse
-            self._eb_manager = EnergyBalanceManager()
+            # Check if Rn and G are available
+            rn = self.data.get("R_n")
+            g_flux = self.data.get("G")
+            
+            if rn is None:
+                raise ValueError("Net radiation (R_n) not found. Calculate radiation balance first.")
+            if g_flux is None:
+                raise ValueError("Soil heat flux (G) not found. Calculate soil heat flux first.")
 
-            # Calculate energy balance components
-            # Note: This will be updated after calibration with anchor pixels
+            # Initialize or reuse energy balance manager
+            if self._eb_manager is None:
+                self._eb_manager = EnergyBalanceManager()
+
+            # Calculate energy balance components (H and LE)
+            # This will use the anchor pixel calibration set during calibrate() step
             eb_results = self._eb_manager.calculate(self.data)
 
             logger.info("Energy balance calculation completed")
@@ -433,15 +529,37 @@ class METRICPipeline:
 
             logger.info("Starting METRIC calibration")
 
-            # Select anchor pixels using configurable method
+            # Select anchor pixels using enhanced physical method with Rn-G optimization
             calibration_config = self.config.get('calibration', {})
-            method = calibration_config.get('method', 'triangle')
-            anchor_selector = AnchorPixelSelector(method=method)
-            anchor_result = anchor_selector.select_anchor_pixels(
-                ts=self.data.get("lwir11"),
-                ndvi=self.data.get("ndvi"),
-                albedo=self.data.get("albedo")
-            )
+            method = calibration_config.get('method', 'enhanced_physical')
+            
+            # Check if Rn and G are available for energy-based selection
+            rn = self.data.get("R_n")
+            g_flux = self.data.get("G")
+            
+            if rn is None or g_flux is None:
+                raise ValueError("Rn and G must be computed before anchor pixel selection. "
+                               "Check radiation balance and soil heat flux calculations.")
+            
+            if method == 'enhanced_physical':
+                # Use enhanced selector which needs DataCube with Rn and G
+                from ..calibration.anchor_pixels_enhanced import EnhancedAnchorPixelSelector
+                anchor_selector = EnhancedAnchorPixelSelector()
+                
+                # Perform anchor pixel selection with energy-based optimization
+                anchor_result = anchor_selector.select_anchor_pixels(
+                    cube=self.data,
+                    rn=rn.values,
+                    g_flux=g_flux.values
+                )
+            else:
+                # Use standard selector with arrays
+                anchor_selector = AnchorPixelSelector(method=method)
+                anchor_result = anchor_selector.select_anchor_pixels(
+                    ts=self.data.get("lst").values,
+                    ndvi=self.data.get("ndvi").values if self.data.get("ndvi") is not None else None,
+                    albedo=self.data.get("albedo").values if self.data.get("albedo") is not None else None
+                )
 
             # Debug logging for anchor result
             logger.info(f"anchor_result type: {type(anchor_result)}")
@@ -569,7 +687,7 @@ class METRICPipeline:
                 logger.info(f"Daily Shortwave Sum: {len(valid_rs_daily)} valid pixels, range [{np.min(valid_rs_daily):.1f}, {np.max(valid_rs_daily):.1f}] MJ/m²/day, mean={np.mean(valid_rs_daily):.1f} MJ/m²/day")
 
             # Log surface temperature
-            ts_kelvin = self.data.get("lwir11")
+            ts_kelvin = self.data.get("lst")
             if ts_kelvin is not None:
                 valid_ts = ts_kelvin.values[~np.isnan(ts_kelvin.values)]
                 logger.info(f"Surface Temperature (Ts): {len(valid_ts)} valid pixels, range [{np.min(valid_ts)-273.15:.1f}, {np.max(valid_ts)-273.15:.1f}] °C, mean={np.mean(valid_ts)-273.15:.1f} °C")
@@ -684,7 +802,7 @@ class METRICPipeline:
         results = {}
 
         # Surface properties
-        surface_keys = ['ndvi', 'albedo', 'emissivity', 'lai', 'z0m', 'd']
+        surface_keys = ['ndvi', 'albedo', 'emissivity', 'lst', 'lai', 'z0m', 'd']
         for key in surface_keys:
             if key in self.data.bands():
                 results[key] = self.data.get(key)
