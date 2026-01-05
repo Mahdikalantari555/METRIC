@@ -30,8 +30,8 @@ from metric_et.core.constants import (
 @dataclass
 class SoilHeatFluxConfig:
     """Configuration for soil heat flux calculation."""
-    # Method selection: 'bastiaanssen', 'allen', 'moran', 'simple', 'document'
-    method: str = 'document'
+    # Method selection: 'bastiaanssen', 'allen', 'moran', 'simple', 'document', 'automatic'
+    method: str = 'automatic'
     
     # Vegetation threshold for switching between bare soil and vegetation formulas
     ndvi_threshold: float = 0.2
@@ -99,6 +99,8 @@ class SoilHeatFlux:
             return self._simple_method(ndvi)
         elif method == 'document':
             return self._document_method(ndvi, ts_kelvin, albedo)
+        elif method == 'automatic':
+            return self._automatic_method(ndvi, ts_kelvin, ta_kelvin, albedo)
         else:
             raise ValueError(f"Unknown soil heat flux method: {method}")
     
@@ -236,7 +238,41 @@ class SoilHeatFlux:
         gn_ratio = np.clip(gn_ratio, self.config.min_gn_ratio, self.config.max_gn_ratio)
 
         return gn_ratio
-    
+
+    def _automatic_method(
+        self,
+        ndvi: np.ndarray,
+        ts_kelvin: Optional[np.ndarray] = None,
+        ta_kelvin: Optional[np.ndarray] = None,
+        albedo: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """
+        Automatic method selection for G/Rn based on available data.
+
+        Priority order:
+        1. 'document' - if albedo and surface temperature are available (enhanced physical)
+        2. 'moran' - if air temperature is available
+        3. 'bastiaanssen' - fallback method
+
+        Args:
+            ndvi: Normalized Difference Vegetation Index (0-1)
+            ts_kelvin: Surface temperature in Kelvin (optional)
+            ta_kelvin: Air temperature in Kelvin (optional)
+            albedo: Surface broadband albedo (optional)
+
+        Returns:
+            G/Rn ratio array
+        """
+        # Check if we can use the enhanced document method
+        if albedo is not None and ts_kelvin is not None:
+            return self._document_method(ndvi, ts_kelvin, albedo)
+        # Check if we can use Moran method
+        elif ta_kelvin is not None and ts_kelvin is not None:
+            return self._moran_method(ndvi, ts_kelvin, ta_kelvin)
+        # Fallback to Bastiaanssen method
+        else:
+            return self._bastiaanssen_method(ndvi)
+
     def calculate(
         self,
         rn: np.ndarray,
@@ -365,15 +401,16 @@ class SoilHeatFlux:
 
 
 def create_soil_heat_flux(
-    method: str = 'document',
+    method: str = 'automatic',
     **kwargs
 ) -> SoilHeatFlux:
     """
     Factory function to create SoilHeatFlux instance.
 
     Args:
-        method: Calculation method ('document', 'bastiaanssen', 'allen', 'moran', 'simple')
-               'document' uses the equation from METRIC_Workflow.md
+        method: Calculation method ('automatic', 'document', 'bastiaanssen', 'allen', 'moran', 'simple')
+                'automatic' chooses the best method based on available data
+                'document' uses the equation from METRIC_Workflow.md (enhanced physical)
         **kwargs: Additional configuration parameters
 
     Returns:

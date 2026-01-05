@@ -37,7 +37,7 @@ from metric_et.energy_balance.latent_heat_flux import (
 class EnergyBalanceConfig:
     """Configuration for the energy balance manager."""
     # G configuration
-    g_method: str = 'document'
+    g_method: str = 'automatic'
     g_ndvi_threshold: float = 0.2
     
     # H configuration
@@ -122,7 +122,8 @@ class EnergyBalanceManager:
         ndvi: np.ndarray,
         albedo: Optional[np.ndarray] = None,
         pressure_pa: Optional[np.ndarray] = None,
-        lai: Optional[np.ndarray] = None
+        lai: Optional[np.ndarray] = None,
+        g_flux: Optional[np.ndarray] = None  # Optional pre-computed G
     ) -> Dict[str, np.ndarray]:
         """
         Calculate all energy balance components from arrays.
@@ -147,9 +148,16 @@ class EnergyBalanceManager:
                 - 'EF': Evaporative fraction
                 - 'ET_inst': Instantaneous ET rate (mm/hr)
         """
-        # Calculate soil heat flux (G)
-        g_result = self.g_calculator.calculate(rn, ndvi, ts_kelvin, ta_kelvin)
-        G = g_result['G']
+        # Calculate soil heat flux (G) - either use pre-computed or calculate
+        if g_flux is not None:
+            # Use pre-computed G from pipeline
+            G = g_flux
+            # Create a minimal result dict for compatibility
+            g_result = {'G': G, 'G_Rn_ratio': G / np.maximum(rn, 1.0)}
+        else:
+            # Calculate G as part of energy balance
+            g_result = self.g_calculator.calculate(rn, ndvi, ts_kelvin, ta_kelvin)
+            G = g_result['G']
         
         # Calculate sensible heat flux (H)
         h_result = self.h_calculator.calculate(
@@ -225,18 +233,35 @@ class EnergyBalanceManager:
         lai = cube.get('lai') if 'lai' in cube.bands() else None
         albedo = cube.get('albedo') if 'albedo' in cube.bands() else None
         
-        # Calculate energy balance
-        results = self.calculate_from_arrays(
-            rn=rn,
-            ts_kelvin=ts_kelvin,
-            ta_kelvin=ta_kelvin,
-            u=u,
-            z0m=z0m,
-            ndvi=ndvi,
-            albedo=albedo,
-            pressure_pa=pressure_pa,
-            lai=lai
-        )
+        # Check if G is already computed (for METRIC pipeline reordering)
+        g_flux = cube.get('G')
+        if g_flux is not None:
+            # Use existing G calculation from pipeline
+            results = self.calculate_from_arrays(
+                rn=rn,
+                ts_kelvin=ts_kelvin,
+                ta_kelvin=ta_kelvin,
+                u=u,
+                z0m=z0m,
+                ndvi=ndvi,
+                albedo=albedo,
+                pressure_pa=pressure_pa,
+                lai=lai,
+                g_flux=g_flux  # Pass existing G
+            )
+        else:
+            # Calculate G as part of energy balance
+            results = self.calculate_from_arrays(
+                rn=rn,
+                ts_kelvin=ts_kelvin,
+                ta_kelvin=ta_kelvin,
+                u=u,
+                z0m=z0m,
+                ndvi=ndvi,
+                albedo=albedo,
+                pressure_pa=pressure_pa,
+                lai=lai
+            )
         
         # Add results to cube
         for key in self.config.output_keys:
@@ -318,7 +343,7 @@ class EnergyBalanceManager:
 
 
 def create_energy_balance_manager(
-    g_method: str = 'document',
+    g_method: str = 'automatic',
     h_use_stability: bool = True,
     dt_a: Optional[float] = None,
     dt_b: Optional[float] = None

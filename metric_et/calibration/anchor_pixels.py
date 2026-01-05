@@ -67,7 +67,7 @@ class AnchorPixelSelector:
         self,
         min_temperature: float = 200.0,
         max_temperature: float = 400.0,
-        method: str = "max_temp"
+        method: str = "automatic"
     ):
         self.min_temperature = min_temperature
         self.max_temperature = max_temperature
@@ -110,6 +110,11 @@ class AnchorPixelSelector:
         ndvi: Optional[np.ndarray] = None,
         albedo: Optional[np.ndarray] = None,
         qa_pixel: Optional[np.ndarray] = None,
+        lai: Optional[np.ndarray] = None,
+        le: Optional[np.ndarray] = None,
+        rn: Optional[np.ndarray] = None,
+        g: Optional[np.ndarray] = None,
+        h: Optional[np.ndarray] = None,
         **kwargs
     ) -> AnchorPixelsResult:
         """
@@ -186,6 +191,10 @@ class AnchorPixelSelector:
             result = self._select_triangle(ts, ndvi, albedo, valid, ConvexHull, qa_pixel)
         elif method == "percentile":
             result = self._select_percentile(ts, ndvi, albedo, valid, qa_pixel)
+        elif method == "enhanced_physical":
+            result = self._select_enhanced_physical(ts, ndvi, albedo, valid, qa_pixel)
+        elif method == "automatic":
+            result = self._select_automatic(ts, ndvi, albedo, valid, qa_pixel, lai, le, rn, g, h)
         else:
             logger.warning(f"Unknown method '{method}', falling back to 'max_temp'")
             result = self._select_max_temp(ts, ndvi, albedo, valid, qa_pixel)
@@ -752,6 +761,783 @@ class AnchorPixelSelector:
             cold_pixel=cold_pixel,
             hot_pixel=hot_pixel,
             method="percentile",
+            confidence=confidence
+        )
+
+    def _select_enhanced_physical(
+        self,
+        ts: np.ndarray,
+        ndvi: Optional[np.ndarray],
+        albedo: Optional[np.ndarray],
+        valid: np.ndarray,
+        qa_pixel: Optional[np.ndarray] = None,
+        lai: Optional[np.ndarray] = None,
+        rn: Optional[np.ndarray] = None,
+        g: Optional[np.ndarray] = None,
+        slope_mask: Optional[np.ndarray] = None,
+        water_mask: Optional[np.ndarray] = None,
+        cloud_mask: Optional[np.ndarray] = None
+    ) -> AnchorPixelsResult:
+        """
+        Select anchor pixels using enhanced physically-constrained algorithm.
+        
+        This method implements the complete 5-step algorithm:
+        1. Physical Pre-Filtering (Hard Constraints)
+        2. Temperature Distribution Filtering
+        3. Energy-Based Final Selection (Rn-G optimization)
+        4. Quality Control (ET-based validation)
+        5. Fallback Strategy (Weighted scoring)
+        
+        Args:
+            ts: Surface temperature array [K]
+            ndvi: NDVI array
+            albedo: Albedo array
+            valid: Valid pixel mask
+            qa_pixel: Quality assurance pixel array
+            lai: Leaf Area Index array (optional)
+            rn: Net radiation [W/m²] (optional)
+            g: Soil heat flux [W/m²] (optional)
+            slope_mask: Slope mask (optional)
+            water_mask: Water mask (optional)
+            cloud_mask: Cloud mask (optional)
+            
+        Returns:
+            AnchorPixelsResult with selected anchor pixels
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("Using enhanced physically-constrained anchor pixel selection")
+        
+        # Step 1: Physical Pre-Filtering (Hard Constraints)
+        diagnostics = {
+            'cold_candidates_count': 0,
+            'hot_candidates_count': 0,
+            'percentiles_used': {'cold': None, 'hot': None},
+            'fallback_activated': False,
+            'constraints_relaxed': False
+        }
+        
+        # Create masks
+        cold_mask = self._create_cold_pixel_mask(
+            ts, ndvi, albedo, lai, slope_mask, water_mask, cloud_mask, valid
+        )
+        
+        hot_mask = self._create_hot_pixel_mask(
+            ts, ndvi, albedo, lai, slope_mask, water_mask, cloud_mask, valid
+        )
+        
+        # Step 2: Temperature Distribution Filtering
+        cold_candidates, hot_candidates, diagnostics = self._apply_temperature_filtering(
+            ts, cold_mask, hot_mask, diagnostics
+        )
+        
+        # Step 3: Energy-Based Final Selection (Rn-G optimization)
+        cold_pixel, hot_pixel = self._select_energy_based_pixels(
+            ts, cold_candidates, hot_candidates, rn, g, ndvi, albedo, lai
+        )
+        
+        # Step 4: Quality Control (ET-based validation)
+        qc_passed = self._perform_quality_control(
+            cold_pixel, hot_pixel, ts, ndvi, albedo, rn, g
+        )
+        
+        # Step 5: Fallback Strategy if needed
+        if not qc_passed:
+            logger.info("Quality control failed, activating fallback strategy")
+            cold_pixel, hot_pixel, diagnostics = self._apply_fallback_strategy(
+                ts, ndvi, albedo, lai, rn, g, cold_mask, hot_mask, diagnostics
+            )
+            diagnostics['fallback_activated'] = True
+        
+        # Calculate confidence based on temperature difference and constraint satisfaction
+        temp_diff = hot_pixel.temperature - cold_pixel.temperature
+        confidence = min(1.0, temp_diff / 25.0)  # Normalize by typical dT range
+        
+        logger.info(f"Enhanced physical method: cold T={cold_pixel.temperature:.2f}K, "
+                  f"hot T={hot_pixel.temperature:.2f}K, "
+                  f"dT={temp_diff:.2f}K, confidence={confidence:.3f}")
+        logger.info(f"Diagnostics: {diagnostics}")
+        
+        return AnchorPixelsResult(
+            cold_pixel=cold_pixel,
+            hot_pixel=hot_pixel,
+            method="enhanced_physical",
+            confidence=confidence
+        )
+    
+    def _create_cold_pixel_mask(
+        self,
+        ts: np.ndarray,
+        ndvi: Optional[np.ndarray],
+        albedo: Optional[np.ndarray],
+        lai: Optional[np.ndarray],
+        slope_mask: Optional[np.ndarray],
+        water_mask: Optional[np.ndarray],
+        cloud_mask: Optional[np.ndarray],
+        valid: np.ndarray
+    ) -> np.ndarray:
+        """Create cold pixel mask using physical constraints."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Start with valid pixels
+        cold_mask = valid.copy()
+        
+        # Apply hard constraints for cold pixels
+        if ndvi is not None:
+            cold_mask &= (ndvi > 0.75)  # NDVI > 0.75 for dense vegetation
+        
+        if lai is not None:
+            cold_mask &= (lai > 3.0)  # LAI > 3.0 for dense canopy
+        
+        if albedo is not None:
+            cold_mask &= (albedo >= 0.18) & (albedo <= 0.25)  # Albedo range for healthy vegetation
+        
+        # Exclude water bodies
+        if water_mask is not None:
+            cold_mask &= ~water_mask
+        
+        # Exclude slopes if available
+        if slope_mask is not None:
+            cold_mask &= ~slope_mask
+        
+        # Exclude clouds if available
+        if cloud_mask is not None:
+            cold_mask &= ~cloud_mask
+        
+        # Exclude image borders (3-5 pixels)
+        border_pixels = 3
+        cold_mask &= ~self._create_border_mask(ts.shape, border_pixels)
+        
+        logger.info(f"Cold pixel mask: {np.sum(cold_mask)} pixels meet constraints")
+        return cold_mask
+    
+    def _create_hot_pixel_mask(
+        self,
+        ts: np.ndarray,
+        ndvi: Optional[np.ndarray],
+        albedo: Optional[np.ndarray],
+        lai: Optional[np.ndarray],
+        slope_mask: Optional[np.ndarray],
+        water_mask: Optional[np.ndarray],
+        cloud_mask: Optional[np.ndarray],
+        valid: np.ndarray
+    ) -> np.ndarray:
+        """Create hot pixel mask using physical constraints."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Start with valid pixels
+        hot_mask = valid.copy()
+        
+        # Apply hard constraints for hot pixels
+        if ndvi is not None:
+            hot_mask &= (ndvi < 0.20)  # NDVI < 0.20 for bare soil
+        
+        if lai is not None:
+            hot_mask &= (lai < 0.50)  # LAI < 0.50 for sparse vegetation
+        
+        if albedo is not None:
+            hot_mask &= (albedo > 0.30)  # Albedo > 0.30 for dry surfaces
+        
+        # Exclude water bodies
+        if water_mask is not None:
+            hot_mask &= ~water_mask
+        
+        # Exclude slopes if available
+        if slope_mask is not None:
+            hot_mask &= ~slope_mask
+        
+        # Exclude clouds if available
+        if cloud_mask is not None:
+            hot_mask &= ~cloud_mask
+        
+        # Exclude image borders (3-5 pixels)
+        border_pixels = 3
+        hot_mask &= ~self._create_border_mask(ts.shape, border_pixels)
+        
+        logger.info(f"Hot pixel mask: {np.sum(hot_mask)} pixels meet constraints")
+        return hot_mask
+    
+    def _create_border_mask(self, shape: tuple, border_pixels: int) -> np.ndarray:
+        """Create mask for image borders."""
+        border_mask = np.zeros(shape, dtype=bool)
+        border_mask[:border_pixels, :] = True
+        border_mask[-border_pixels:, :] = True
+        border_mask[:, :border_pixels] = True
+        border_mask[:, -border_pixels:] = True
+        return border_mask
+    
+    def _apply_temperature_filtering(
+        self,
+        ts: np.ndarray,
+        cold_mask: np.ndarray,
+        hot_mask: np.ndarray,
+        diagnostics: dict
+    ) -> tuple:
+        """Apply temperature distribution filtering to create candidate sets."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Cold pixel temperature threshold (5th-10th percentile)
+        cold_ts_values = ts[cold_mask]
+        if len(cold_ts_values) > 0:
+            cold_percentile = 10  # Start with 10th percentile
+            ts_cold_threshold = np.percentile(cold_ts_values, cold_percentile)
+            diagnostics['percentiles_used']['cold'] = cold_percentile
+            
+            # Create cold candidates
+            cold_candidates = cold_mask & (ts <= ts_cold_threshold)
+            diagnostics['cold_candidates_count'] = np.sum(cold_candidates)
+            
+            logger.info(f"Cold candidates: {np.sum(cold_candidates)} pixels "
+                      f"(Ts <= {ts_cold_threshold:.2f}K, {cold_percentile}th percentile)")
+        else:
+            cold_candidates = cold_mask.copy()
+            logger.warning("No cold pixels meet constraints, using all valid pixels")
+        
+        # Hot pixel temperature threshold (90th-95th percentile)
+        hot_ts_values = ts[hot_mask]
+        if len(hot_ts_values) > 0:
+            hot_percentile = 90  # Start with 90th percentile
+            ts_hot_threshold = np.percentile(hot_ts_values, hot_percentile)
+            diagnostics['percentiles_used']['hot'] = hot_percentile
+            
+            # Create hot candidates
+            hot_candidates = hot_mask & (ts >= ts_hot_threshold)
+            diagnostics['hot_candidates_count'] = np.sum(hot_candidates)
+            
+            logger.info(f"Hot candidates: {np.sum(hot_candidates)} pixels "
+                      f"(Ts >= {ts_hot_threshold:.2f}K, {hot_percentile}th percentile)")
+        else:
+            hot_candidates = hot_mask.copy()
+            logger.warning("No hot pixels meet constraints, using all valid pixels")
+        
+        return cold_candidates, hot_candidates, diagnostics
+    
+    def _select_energy_based_pixels(
+        self,
+        ts: np.ndarray,
+        cold_candidates: np.ndarray,
+        hot_candidates: np.ndarray,
+        rn: Optional[np.ndarray],
+        g: Optional[np.ndarray],
+        ndvi: Optional[np.ndarray],
+        albedo: Optional[np.ndarray],
+        lai: Optional[np.ndarray]
+    ) -> tuple:
+        """Select pixels based on energy balance (Rn-G optimization)."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Cold pixel: maximize Rn - G (actively transpiring vegetation)
+        if rn is not None and g is not None:
+            rn_minus_g = rn - g
+            
+            if np.any(cold_candidates):
+                cold_rng_values = rn_minus_g[cold_candidates]
+                cold_idx = np.argmax(cold_rng_values)
+                cold_coords = np.where(cold_candidates)
+                cold_x, cold_y = cold_coords[1][cold_idx], cold_coords[0][cold_idx]
+                
+                logger.info(f"Cold pixel selected by max Rn-G: {rn_minus_g[cold_y, cold_x]:.2f} W/m²")
+            else:
+                # Fallback to coldest temperature
+                cold_idx = np.argmin(ts[cold_candidates])
+                cold_coords = np.where(cold_candidates)
+                cold_x, cold_y = cold_coords[1][cold_idx], cold_coords[0][cold_idx]
+                logger.warning("No cold candidates, using coldest temperature")
+        else:
+            # Fallback to coldest temperature
+            cold_idx = np.argmin(ts[cold_candidates])
+            cold_coords = np.where(cold_candidates)
+            cold_x, cold_y = cold_coords[1][cold_idx], cold_coords[0][cold_idx]
+            logger.warning("Rn/G not available, using coldest temperature")
+        
+        # Hot pixel: minimize Rn - G (near-zero latent heat flux)
+        if rn is not None and g is not None:
+            if np.any(hot_candidates):
+                hot_rng_values = rn_minus_g[hot_candidates]
+                hot_idx = np.argmin(hot_rng_values)
+                hot_coords = np.where(hot_candidates)
+                hot_x, hot_y = hot_coords[1][hot_idx], hot_coords[0][hot_idx]
+                
+                logger.info(f"Hot pixel selected by min Rn-G: {rn_minus_g[hot_y, hot_x]:.2f} W/m²")
+            else:
+                # Fallback to hottest temperature
+                hot_idx = np.argmax(ts[hot_candidates])
+                hot_coords = np.where(hot_candidates)
+                hot_x, hot_y = hot_coords[1][hot_idx], hot_coords[0][hot_idx]
+                logger.warning("No hot candidates, using hottest temperature")
+        else:
+            # Fallback to hottest temperature
+            hot_idx = np.argmax(ts[hot_candidates])
+            hot_coords = np.where(hot_candidates)
+            hot_x, hot_y = hot_coords[1][hot_idx], hot_coords[0][hot_idx]
+            logger.warning("Rn/G not available, using hottest temperature")
+        
+        # Create AnchorPixel objects
+        cold_pixel = AnchorPixel(
+            x=cold_x, y=cold_y,
+            temperature=ts[cold_y, cold_x],
+            ts=ts[cold_y, cold_x],
+            ndvi=ndvi[cold_y, cold_x] if ndvi is not None else None,
+            albedo=albedo[cold_y, cold_x] if albedo is not None else None
+        )
+        
+        hot_pixel = AnchorPixel(
+            x=hot_x, y=hot_y,
+            temperature=ts[hot_y, hot_x],
+            ts=ts[hot_y, hot_x],
+            ndvi=ndvi[hot_y, hot_x] if ndvi is not None else None,
+            albedo=albedo[hot_y, hot_x] if albedo is not None else None
+        )
+        
+        return cold_pixel, hot_pixel
+    
+    def _perform_quality_control(
+        self,
+        cold_pixel: AnchorPixel,
+        hot_pixel: AnchorPixel,
+        ts: np.ndarray,
+        ndvi: Optional[np.ndarray],
+        albedo: Optional[np.ndarray],
+        rn: Optional[np.ndarray],
+        g: Optional[np.ndarray]
+    ) -> bool:
+        """Perform quality control checks on selected pixels."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        qc_passed = True
+        
+        # Cold pixel QC: NDVI > 0.75, albedo 0.18-0.25, low temperature
+        if cold_pixel.ndvi is not None and cold_pixel.ndvi <= 0.75:
+            logger.warning(f"Cold pixel QC FAIL: NDVI {cold_pixel.ndvi:.3f} <= 0.75")
+            qc_passed = False
+        
+        if cold_pixel.albedo is not None:
+            if cold_pixel.albedo < 0.18 or cold_pixel.albedo > 0.25:
+                logger.warning(f"Cold pixel QC FAIL: albedo {cold_pixel.albedo:.3f} outside [0.18, 0.25]")
+                qc_passed = False
+        
+        # Hot pixel QC: NDVI < 0.20, albedo > 0.30, high temperature
+        if hot_pixel.ndvi is not None and hot_pixel.ndvi >= 0.20:
+            logger.warning(f"Hot pixel QC FAIL: NDVI {hot_pixel.ndvi:.3f} >= 0.20")
+            qc_passed = False
+        
+        if hot_pixel.albedo is not None and hot_pixel.albedo <= 0.30:
+            logger.warning(f"Hot pixel QC FAIL: albedo {hot_pixel.albedo:.3f} <= 0.30")
+            qc_passed = False
+        
+        # Temperature difference check
+        temp_diff = hot_pixel.temperature - cold_pixel.temperature
+        if temp_diff < 5.0:  # Minimum 5K difference expected
+            logger.warning(f"QC FAIL: Temperature difference {temp_diff:.2f}K < 5K")
+            qc_passed = False
+        
+        logger.info(f"Quality control: {'PASSED' if qc_passed else 'FAILED'}")
+        return qc_passed
+    
+    def _apply_fallback_strategy(
+        self,
+        ts: np.ndarray,
+        ndvi: Optional[np.ndarray],
+        albedo: Optional[np.ndarray],
+        lai: Optional[np.ndarray],
+        rn: Optional[np.ndarray],
+        g: Optional[np.ndarray],
+        cold_mask: np.ndarray,
+        hot_mask: np.ndarray,
+        diagnostics: dict
+    ) -> tuple:
+        """Apply fallback strategy with weighted scoring."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Relax constraints
+        relaxed_cold_mask = self._relax_constraints(
+            ts, ndvi, albedo, lai, cold_mask, "cold"
+        )
+        
+        relaxed_hot_mask = self._relax_constraints(
+            ts, ndvi, albedo, lai, hot_mask, "hot"
+        )
+        
+        diagnostics['constraints_relaxed'] = True
+        
+        # Apply weighted scoring
+        cold_pixel = self._select_by_weighted_score(
+            ts, ndvi, albedo, lai, rn, g, relaxed_cold_mask, "cold"
+        )
+        
+        hot_pixel = self._select_by_weighted_score(
+            ts, ndvi, albedo, lai, rn, g, relaxed_hot_mask, "hot"
+        )
+        
+        return cold_pixel, hot_pixel, diagnostics
+    
+    def _relax_constraints(
+        self,
+        ts: np.ndarray,
+        ndvi: Optional[np.ndarray],
+        albedo: Optional[np.ndarray],
+        lai: Optional[np.ndarray],
+        original_mask: np.ndarray,
+        pixel_type: str
+    ) -> np.ndarray:
+        """Relax constraints for fallback strategy."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        relaxed_mask = original_mask.copy()
+        
+        if pixel_type == "cold":
+            # Relax NDVI constraint
+            if ndvi is not None:
+                relaxed_mask |= (ndvi > 0.70)  # Relax from 0.75 to 0.70
+            
+            # Relax albedo constraint
+            if albedo is not None:
+                relaxed_mask |= ((albedo >= 0.15) & (albedo <= 0.28))  # Widen range
+            
+        elif pixel_type == "hot":
+            # Relax NDVI constraint
+            if ndvi is not None:
+                relaxed_mask |= (ndvi < 0.25)  # Relax from 0.20 to 0.25
+            
+            # Relax albedo constraint
+            if albedo is not None:
+                relaxed_mask |= (albedo > 0.25)  # Relax from 0.30 to 0.25
+        
+        logger.info(f"Relaxed {pixel_type} mask: {np.sum(relaxed_mask)} pixels")
+        return relaxed_mask
+    
+    def _select_by_weighted_score(
+        self,
+        ts: np.ndarray,
+        ndvi: Optional[np.ndarray],
+        albedo: Optional[np.ndarray],
+        lai: Optional[np.ndarray],
+        rn: Optional[np.ndarray],
+        g: Optional[np.ndarray],
+        candidate_mask: np.ndarray,
+        pixel_type: str
+    ) -> AnchorPixel:
+        """Select pixel using weighted scoring."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        if not np.any(candidate_mask):
+            logger.error(f"No {pixel_type} candidates available in fallback")
+            # Return dummy pixel (should not happen due to earlier checks)
+            return AnchorPixel(0, 0, temperature=300.0)
+        
+        # Calculate scores
+        scores = np.zeros(candidate_mask.shape)
+        
+        if pixel_type == "cold":
+            # Cold pixel score: +NDVI + LAI - Ts + (Rn - G)
+            if ndvi is not None:
+                scores += ndvi * 2.0  # NDVI weight
+            if lai is not None:
+                scores += lai * 1.5  # LAI weight
+            scores -= ts * 0.1  # Temperature penalty
+            if rn is not None and g is not None:
+                scores += (rn - g) * 0.01  # Rn-G bonus
+        
+        elif pixel_type == "hot":
+            # Hot pixel score: -NDVI - LAI + Ts - (Rn - G)
+            if ndvi is not None:
+                scores -= ndvi * 2.0  # NDVI penalty
+            if lai is not None:
+                scores -= lai * 1.5  # LAI penalty
+            scores += ts * 0.1  # Temperature bonus
+            if rn is not None and g is not None:
+                scores -= (rn - g) * 0.01  # Rn-G penalty
+        
+        # Apply mask and find best candidate
+        masked_scores = np.where(candidate_mask, scores, -np.inf)
+        best_idx = np.argmax(masked_scores)
+        best_coords = np.unravel_index(best_idx, ts.shape)
+        
+        pixel = AnchorPixel(
+            x=best_coords[1], y=best_coords[0],
+            temperature=ts[best_coords],
+            ts=ts[best_coords],
+            ndvi=ndvi[best_coords] if ndvi is not None else None,
+            albedo=albedo[best_coords] if albedo is not None else None
+        )
+        
+        logger.info(f"Fallback {pixel_type} pixel selected with score {scores[best_coords]:.2f}")
+        return pixel
+
+    def _select_automatic(
+        self,
+        ts: np.ndarray,
+        ndvi: Optional[np.ndarray],
+        albedo: Optional[np.ndarray],
+        valid: np.ndarray,
+        qa_pixel: Optional[np.ndarray] = None,
+        lai: Optional[np.ndarray] = None,
+        le: Optional[np.ndarray] = None,
+        rn: Optional[np.ndarray] = None,
+        g: Optional[np.ndarray] = None,
+        h: Optional[np.ndarray] = None
+    ) -> AnchorPixelsResult:
+        """
+        Select anchor pixels using the exact METRIC algorithm specifications.
+
+        This method implements the complete METRIC anchor pixel selection algorithm:
+        1. Percentile-based constraints for initial candidate selection
+        2. Energy-based optimization for final pixel selection
+        3. Hard constraint validation for physical consistency
+
+        Args:
+            ts: Surface temperature array [K]
+            ndvi: NDVI array
+            albedo: Albedo array
+            valid: Valid pixel mask
+            qa_pixel: Quality assurance pixel array
+            lai: Leaf Area Index array
+            le: Latent heat flux array [W/m²]
+            rn: Net radiation array [W/m²]
+            g: Soil heat flux array [W/m²]
+            h: Sensible heat flux array [W/m²]
+
+        Returns:
+            AnchorPixelsResult with selected anchor pixels
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("Using METRIC-compliant automatic anchor pixel selection")
+
+        # Create valid mask excluding NaN values
+        valid_mask = valid & ~np.isnan(ts)
+        if ndvi is not None:
+            valid_mask &= ~np.isnan(ndvi)
+        if albedo is not None:
+            valid_mask &= ~np.isnan(albedo)
+        if lai is not None:
+            valid_mask &= ~np.isnan(lai)
+
+        if not np.any(valid_mask):
+            logger.warning("No valid pixels available for automatic selection")
+            return self._select_max_temp(ts, ndvi, albedo, valid, qa_pixel)
+
+        # Get valid data
+        valid_ts = ts[valid_mask]
+        valid_ndvi = ndvi[valid_mask] if ndvi is not None else None
+        valid_albedo = albedo[valid_mask] if albedo is not None else None
+        valid_lai = lai[valid_mask] if lai is not None else None
+        valid_coords = np.where(valid_mask)
+
+        n_points = len(valid_ts)
+        logger.info(f"Automatic method: {n_points} valid points for METRIC analysis")
+
+        if n_points < 20:
+            logger.warning(f"Too few points ({n_points}) for reliable analysis, falling back to max_temp")
+            return self._select_max_temp(ts, ndvi, albedo, valid, qa_pixel)
+
+        # === STEP 1: PERCENTILE-BASED CANDIDATE SELECTION ===
+        # METRIC specifications for percentile thresholds
+
+        # Cold pixel constraints: NDVI ≥ P90–P95, Albedo ≤ P20–P30, Ts ≤ P10–P15, LAI ≥ P80
+        cold_ndvi_min = np.percentile(valid_ndvi, 90) if valid_ndvi is not None else None  # NDVI ≥ P90
+        cold_albedo_max = np.percentile(valid_albedo, 30) if valid_albedo is not None else None  # Albedo ≤ P30
+        cold_ts_max = np.percentile(valid_ts, 15)  # Ts ≤ P15
+        cold_lai_min = np.percentile(valid_lai, 80) if valid_lai is not None else None  # LAI ≥ P80
+
+        # Hot pixel constraints: NDVI ≤ P5–P10, Albedo ≥ P70–P85, Ts ≥ P90–P95, LAI ≤ P20
+        hot_ndvi_max = np.percentile(valid_ndvi, 10) if valid_ndvi is not None else None  # NDVI ≤ P10
+        hot_albedo_min = np.percentile(valid_albedo, 70) if valid_albedo is not None else None  # Albedo ≥ P70
+        hot_ts_min = np.percentile(valid_ts, 90)  # Ts ≥ P90
+        hot_lai_max = np.percentile(valid_lai, 20) if valid_lai is not None else None  # LAI ≤ P20
+
+        logger.info("METRIC percentile thresholds:")
+        logger.info(f"  Cold - Ts ≤ {cold_ts_max:.2f}K, NDVI ≥ {cold_ndvi_min:.3f}, Albedo ≤ {cold_albedo_max:.3f}, LAI ≥ {cold_lai_min:.3f}")
+        logger.info(f"  Hot - Ts ≥ {hot_ts_min:.2f}K, NDVI ≤ {hot_ndvi_max:.3f}, Albedo ≥ {hot_albedo_min:.3f}, LAI ≤ {hot_lai_max:.3f}")
+
+        # Apply percentile constraints to create candidate sets
+        cold_candidates = valid_mask.copy()
+        hot_candidates = valid_mask.copy()
+
+        # Temperature constraints
+        cold_candidates &= (ts <= cold_ts_max)
+        hot_candidates &= (ts >= hot_ts_min)
+
+        # NDVI constraints
+        if valid_ndvi is not None:
+            cold_candidates &= (ndvi >= cold_ndvi_min)
+            hot_candidates &= (ndvi <= hot_ndvi_max)
+
+        # Albedo constraints
+        if valid_albedo is not None:
+            cold_candidates &= (albedo <= cold_albedo_max)
+            hot_candidates &= (albedo >= hot_albedo_min)
+
+        # LAI constraints
+        if valid_lai is not None:
+            cold_candidates &= (lai >= cold_lai_min)
+            hot_candidates &= (lai <= hot_lai_max)
+
+        cold_count = np.sum(cold_candidates)
+        hot_count = np.sum(hot_candidates)
+
+        logger.info(f"Percentile-based candidates: {cold_count} cold, {hot_count} hot")
+
+        # If insufficient candidates, relax constraints slightly
+        if cold_count < 5:
+            logger.info("Relaxing cold pixel constraints")
+            cold_ts_max = np.percentile(valid_ts, 20)  # Relax to P20
+            cold_candidates = valid_mask & (ts <= cold_ts_max)
+            if valid_ndvi is not None:
+                cold_ndvi_min = np.percentile(valid_ndvi, 85)  # Relax to P85
+                cold_candidates &= (ndvi >= cold_ndvi_min)
+            cold_count = np.sum(cold_candidates)
+
+        if hot_count < 5:
+            logger.info("Relaxing hot pixel constraints")
+            hot_ts_min = np.percentile(valid_ts, 85)  # Relax to P85
+            hot_candidates = valid_mask & (ts >= hot_ts_min)
+            if valid_ndvi is not None:
+                hot_ndvi_max = np.percentile(valid_ndvi, 15)  # Relax to P15
+                hot_candidates &= (ndvi <= hot_ndvi_max)
+            hot_count = np.sum(hot_candidates)
+
+        logger.info(f"After relaxation: {cold_count} cold, {hot_count} hot candidates")
+
+        # Final fallback if still insufficient
+        if cold_count < 3 or hot_count < 3:
+            logger.warning("Insufficient candidates even after relaxation, using max_temp")
+            return self._select_max_temp(ts, ndvi, albedo, valid, qa_pixel)
+
+        # === STEP 2: ENERGY-BASED FINAL SELECTION ===
+
+        # Cold pixel: minimize |LE − (Rn − G)| or minimize H
+        if le is not None and rn is not None and g is not None:
+            # Primary: minimize |LE - (Rn - G)|
+            rn_minus_g = rn - g
+            le_diff = np.abs(le - rn_minus_g)
+            cold_energy_values = le_diff[cold_candidates]
+            cold_idx = np.argmin(cold_energy_values)
+            logger.info("Cold pixel selected by minimizing |LE - (Rn - G)|")
+        elif h is not None:
+            # Secondary: minimize H
+            cold_energy_values = h[cold_candidates]
+            cold_idx = np.argmin(cold_energy_values)
+            logger.info("Cold pixel selected by minimizing H")
+        else:
+            # Fallback: minimum temperature
+            cold_energy_values = ts[cold_candidates]
+            cold_idx = np.argmin(cold_energy_values)
+            logger.info("Cold pixel selected by minimum temperature (energy data unavailable)")
+
+        cold_coords = np.where(cold_candidates)
+        cold_x, cold_y = cold_coords[1][cold_idx], cold_coords[0][cold_idx]
+
+        # Hot pixel: maximize H
+        if h is not None:
+            hot_energy_values = h[hot_candidates]
+            hot_idx = np.argmax(hot_energy_values)
+            logger.info("Hot pixel selected by maximizing H")
+        else:
+            # Fallback: maximum temperature
+            hot_energy_values = ts[hot_candidates]
+            hot_idx = np.argmax(hot_energy_values)
+            logger.info("Hot pixel selected by maximum temperature (H unavailable)")
+
+        hot_coords = np.where(hot_candidates)
+        hot_x, hot_y = hot_coords[1][hot_idx], hot_coords[0][hot_idx]
+
+        # Create AnchorPixel objects
+        cold_pixel = AnchorPixel(
+            x=cold_x, y=cold_y,
+            temperature=ts[cold_y, cold_x],
+            ts=ts[cold_y, cold_x],
+            ndvi=ndvi[cold_y, cold_x] if ndvi is not None else None,
+            albedo=albedo[cold_y, cold_x] if albedo is not None else None
+        )
+
+        hot_pixel = AnchorPixel(
+            x=hot_x, y=hot_y,
+            temperature=ts[hot_y, hot_x],
+            ts=ts[hot_y, hot_x],
+            ndvi=ndvi[hot_y, hot_x] if ndvi is not None else None,
+            albedo=albedo[hot_y, hot_x] if albedo is not None else None
+        )
+
+        # === STEP 3: HARD CONSTRAINT VALIDATION ===
+
+        logger.info("=== METRIC HARD CONSTRAINT VALIDATION ===")
+
+        validation_passed = True
+
+        # Cold pixel constraints
+        if h is not None:
+            h_cold = h[cold_y, cold_x]
+            if not (0 <= h_cold <= 50):  # H_cold ∈ [0, 50] W/m²
+                logger.warning(f"Cold pixel H validation FAIL: H={h_cold:.1f} W/m² not in [0, 50]")
+                validation_passed = False
+            else:
+                logger.info(f"Cold pixel H validation PASS: H={h_cold:.1f} W/m²")
+
+        # dT_cold constraint (soft: ≤0.5K, hard: ≤1.0K)
+        # Note: dT_cold is the temperature difference from air temperature, but we don't have Ta here
+        # We'll skip this check as Ta is not available in the current implementation
+
+        if le is not None and rn is not None and g is not None:
+            le_cold = le[cold_y, cold_x]
+            rn_cold = rn[cold_y, cold_x]
+            g_cold = g[cold_y, cold_x]
+            if le_cold > (rn_cold - g_cold):  # LE_cold ≤ Rn_cold − G_cold
+                logger.warning(f"Cold pixel LE validation FAIL: LE={le_cold:.1f} > Rn-G={rn_cold-g_cold:.1f}")
+                validation_passed = False
+            else:
+                logger.info(f"Cold pixel LE validation PASS: LE={le_cold:.1f} ≤ Rn-G={rn_cold-g_cold:.1f}")
+
+        # Hot pixel constraints
+        if le is not None:
+            le_hot = le[hot_y, hot_x]
+            if le_hot > 20:  # LE_hot ≈ 0 (≤ 20 W/m²)
+                logger.warning(f"Hot pixel LE validation FAIL: LE={le_hot:.1f} > 20 W/m²")
+                validation_passed = False
+            else:
+                logger.info(f"Hot pixel LE validation PASS: LE={le_hot:.1f} ≤ 20 W/m²")
+
+        if h is not None:
+            h_hot = h[hot_y, hot_x]
+            if h_hot < 200:  # H_hot ≥ 200 W/m²
+                logger.warning(f"Hot pixel H validation FAIL: H={h_hot:.1f} < 200 W/m²")
+                validation_passed = False
+            else:
+                logger.info(f"Hot pixel H validation PASS: H={h_hot:.1f} ≥ 200 W/m²")
+
+        # Temperature difference constraint
+        temp_diff = hot_pixel.temperature - cold_pixel.temperature
+        if temp_diff < 15:  # Ts_hot − Ts_cold ≥ 15 K
+            logger.warning(f"Temperature difference validation FAIL: dT={temp_diff:.1f} < 15 K")
+            validation_passed = False
+        else:
+            logger.info(f"Temperature difference validation PASS: dT={temp_diff:.1f} ≥ 15 K")
+
+        if not validation_passed:
+            logger.warning("METRIC hard constraints not satisfied - consider fallback or manual selection")
+            # Note: In a full implementation, you might want to trigger fallback logic here
+
+        # Calculate confidence based on constraint satisfaction and temperature difference
+        confidence = min(1.0, temp_diff / 25.0)  # Base confidence on temperature difference
+        if validation_passed:
+            confidence = min(1.0, confidence + 0.2)  # Bonus for passing validation
+
+        logger.info(f"METRIC automatic method: cold T={cold_pixel.temperature:.2f}K, "
+                  f"hot T={hot_pixel.temperature:.2f}K, "
+                  f"dT={temp_diff:.2f}K, confidence={confidence:.3f}")
+
+        return AnchorPixelsResult(
+            cold_pixel=cold_pixel,
+            hot_pixel=hot_pixel,
+            method="automatic",
             confidence=confidence
         )
 

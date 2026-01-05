@@ -135,7 +135,7 @@ def main():
 
     # Define paths
     data_dir = r"C:\Users\ASUS\Desktop\et\METRIC\data"
-    output_dir = r"C:\Users\ASUS\Desktop\et\METRIC\output"
+    output_dir = r"C:\Users\ASUS\Desktop\et\METRIC\output_21"
 
     # Create output directory (delete if exists)
     if os.path.exists(output_dir):
