@@ -1,6 +1,6 @@
 """Anchor pixel selection module for METRIC calibration."""
+from typing import Optional, Dict, Any, Tuple
 
-from typing import Optional, Dict, Any
 import numpy as np
 
 
@@ -1355,8 +1355,24 @@ class AnchorPixelSelector:
         hot_lai_max = np.percentile(valid_lai, 20) if valid_lai is not None else None  # LAI ≤ P20
 
         logger.info("METRIC percentile thresholds:")
-        logger.info(f"  Cold - Ts ≤ {cold_ts_max:.2f}K, NDVI ≥ {cold_ndvi_min:.3f}, Albedo ≤ {cold_albedo_max:.3f}, LAI ≥ {cold_lai_min:.3f}")
-        logger.info(f"  Hot - Ts ≥ {hot_ts_min:.2f}K, NDVI ≤ {hot_ndvi_max:.3f}, Albedo ≥ {hot_albedo_min:.3f}, LAI ≤ {hot_lai_max:.3f}")
+        
+        # Format values with None handling
+        cold_ndvi_str = f"{cold_ndvi_min:.3f}" if cold_ndvi_min is not None else "N/A"
+        cold_albedo_str = f"{cold_albedo_max:.3f}" if cold_albedo_max is not None else "N/A"
+        cold_lai_str = f"{cold_lai_min:.3f}" if cold_lai_min is not None else "N/A"
+        
+        hot_ndvi_str = f"{hot_ndvi_max:.3f}" if hot_ndvi_max is not None else "N/A"
+        hot_albedo_str = f"{hot_albedo_min:.3f}" if hot_albedo_min is not None else "N/A"
+        hot_lai_str = f"{hot_lai_max:.3f}" if hot_lai_max is not None else "N/A"
+        
+        logger.info(
+            f"  Cold - Ts ≤ {cold_ts_max:.2f}K, NDVI ≥ {cold_ndvi_str}, "
+            f"Albedo ≤ {cold_albedo_str}, LAI ≥ {cold_lai_str}"
+        )
+        logger.info(
+            f"  Hot - Ts ≥ {hot_ts_min:.2f}K, NDVI ≤ {hot_ndvi_str}, "
+            f"Albedo ≥ {hot_albedo_str}, LAI ≤ {hot_lai_str}"
+        )
 
         # Apply percentile constraints to create candidate sets
         cold_candidates = valid_mask.copy()
@@ -1540,6 +1556,242 @@ class AnchorPixelSelector:
             method="automatic",
             confidence=confidence
         )
+
+    def select_dynamic_candidates(
+        self,
+        ndvi: np.ndarray,
+        lai: np.ndarray,
+        albedo: np.ndarray,
+        valid_mask: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Select dynamic anchor candidates based on percentile thresholds.
+
+        This method implements the dynamic anchor candidate selection algorithm:
+        - Cold candidates: NDVI ≥ P90(NDVI), LAI ≥ 3.0, albedo ≤ 0.18
+        - Hot candidates: NDVI ≤ P10(NDVI), LAI ≤ 0.5, albedo ≥ 0.25
+
+        Requires at least 50 pixels for each category, otherwise rejects the scene.
+
+        Args:
+            ndvi: NDVI array
+            lai: LAI array
+            albedo: Albedo array
+            valid_mask: Optional mask for valid pixels (default: all non-NaN)
+
+        Returns:
+            Tuple of (cold_candidates_mask, hot_candidates_mask)
+
+        Raises:
+            ValueError: If insufficient pixels (< 50) for cold or hot candidates
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Create valid mask if not provided
+        if valid_mask is None:
+            valid_mask = np.ones(ndvi.shape, dtype=bool)
+            valid_mask &= ~np.isnan(ndvi)
+            valid_mask &= ~np.isnan(lai)
+            valid_mask &= ~np.isnan(albedo)
+
+        # Ensure arrays are valid
+        if ndvi is None or lai is None or albedo is None:
+            raise ValueError("NDVI, LAI, and albedo arrays are required")
+
+        # Calculate percentiles
+        valid_ndvi = ndvi[valid_mask]
+        if len(valid_ndvi) == 0:
+            raise ValueError("No valid NDVI pixels found")
+
+        ndvi_p90 = np.percentile(valid_ndvi, 90)  # P90 for cold pixels
+        ndvi_p10 = np.percentile(valid_ndvi, 10)  # P10 for hot pixels
+
+        logger.info(f"Dynamic selection percentiles: NDVI P90={ndvi_p90:.3f}, P10={ndvi_p10:.3f}")
+
+        # Select cold candidates: NDVI ≥ P90, LAI ≥ 3.0, albedo ≤ 0.18
+        cold_mask = valid_mask.copy()
+        cold_mask &= (ndvi >= ndvi_p90)
+        cold_mask &= (lai >= 3.0)
+        cold_mask &= (albedo <= 0.18)
+
+        # Select hot candidates: NDVI ≤ P10, LAI ≤ 0.5, albedo ≥ 0.25
+        hot_mask = valid_mask.copy()
+        hot_mask &= (ndvi <= ndvi_p10)
+        hot_mask &= (lai <= 0.5)
+        hot_mask &= (albedo >= 0.25)
+
+        # Check minimum pixel requirements
+        cold_count = np.sum(cold_mask)
+        hot_count = np.sum(hot_mask)
+
+        logger.info(f"Dynamic candidates selected: {cold_count} cold pixels, {hot_count} hot pixels")
+
+        if cold_count < 50:
+            raise ValueError(f"Insufficient cold pixel candidates: {cold_count} < 50. Scene rejected.")
+
+        if hot_count < 50:
+            raise ValueError(f"Insufficient hot pixel candidates: {hot_count} < 50. Scene rejected.")
+
+        logger.info("Dynamic anchor candidate selection successful")
+        return cold_mask, hot_mask
+
+    def validate_anchor_physics(
+        self,
+        ndvi: np.ndarray,
+        lai: np.ndarray,
+        albedo: np.ndarray,
+        dT: np.ndarray,
+        H: np.ndarray,
+        EF: np.ndarray,
+        LE: np.ndarray,
+        Rn: np.ndarray,
+        G: np.ndarray,
+        valid_mask: Optional[np.ndarray] = None
+    ) -> Dict[str, Any]:
+        """
+        Validate anchor pixels using hard physics constraints.
+        
+        This method implements the METRIC algorithm physics validation:
+        - Cold pixel constraints: |dT_cold| ≤ 0.3 K, H_cold ≤ 30 W/m², EF_cold ≥ 0.95, LE_cold ≤ (Rn_cold − G_cold)
+        - Hot pixel constraints: H_hot ≥ 100 W/m², EF_hot ≤ 0.30, dT_hot ≥ 8 K
+        
+        Cold pixel statistics are calculated as the median of cold candidate pixels,
+        and hot pixel statistics from hot candidate pixels.
+        
+        Args:
+            ndvi: NDVI array
+            lai: LAI array
+            albedo: Albedo array
+            dT: Temperature difference array [K]
+            H: Sensible heat flux array [W/m²]
+            EF: Evaporative fraction array [-]
+            LE: Latent heat flux array [W/m²]
+            Rn: Net radiation array [W/m²]
+            G: Soil heat flux array [W/m²]
+            valid_mask: Optional mask for valid pixels
+            
+        Returns:
+            Dict containing validated anchor statistics:
+            {
+                'cold_stats': {'dT': float, 'H': float, 'EF': float, 'LE': float, 'Rn': float, 'G': float},
+                'hot_stats': {'dT': float, 'H': float, 'EF': float, 'LE': float, 'Rn': float, 'G': float},
+                'validation_passed': bool,
+                'rejected_constraints': List[str]
+            }
+            
+        Raises:
+            ValueError: If physics checks fail (any constraint violated)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Get dynamic candidates using existing method
+        try:
+            cold_mask, hot_mask = self.select_dynamic_candidates(
+                ndvi=ndvi, lai=lai, albedo=albedo, valid_mask=valid_mask
+            )
+        except ValueError as e:
+            logger.error(f"Dynamic candidate selection failed: {e}")
+            raise ValueError(f"Cannot select anchor candidates: {e}")
+        
+        logger.info("=== METRIC ANCHOR PIXEL PHYSICS VALIDATION ===")
+        
+        # Calculate median statistics for cold candidates
+        cold_dT = dT[cold_mask]
+        cold_H = H[cold_mask]
+        cold_EF = EF[cold_mask]
+        cold_LE = LE[cold_mask]
+        cold_Rn = Rn[cold_mask]
+        cold_G = G[cold_mask]
+        
+        # Calculate median statistics for hot candidates
+        hot_dT = dT[hot_mask]
+        hot_H = H[hot_mask]
+        hot_EF = EF[hot_mask]
+        hot_LE = LE[hot_mask]
+        hot_Rn = Rn[hot_mask]
+        hot_G = G[hot_mask]
+        
+        # Calculate median values
+        cold_stats = {
+            'dT': np.median(cold_dT),
+            'H': np.median(cold_H),
+            'EF': np.median(cold_EF),
+            'LE': np.median(cold_LE),
+            'Rn': np.median(cold_Rn),
+            'G': np.median(cold_G)
+        }
+        
+        hot_stats = {
+            'dT': np.median(hot_dT),
+            'H': np.median(hot_H),
+            'EF': np.median(hot_EF),
+            'LE': np.median(hot_LE),
+            'Rn': np.median(hot_Rn),
+            'G': np.median(hot_G)
+        }
+        
+        # Validate cold pixel constraints
+        rejected_constraints = []
+        
+        # Cold pixel: |dT_cold| ≤ 0.3 K
+        if abs(cold_stats['dT']) > 0.3:
+            rejected_constraints.append(f"Cold pixel |dT| = {abs(cold_stats['dT']):.3f} K > 0.3 K")
+        
+        # Cold pixel: H_cold ≤ 30 W/m²
+        if cold_stats['H'] > 30.0:
+            rejected_constraints.append(f"Cold pixel H = {cold_stats['H']:.1f} W/m² > 30 W/m²")
+        
+        # Cold pixel: EF_cold ≥ 0.95
+        if cold_stats['EF'] < 0.95:
+            rejected_constraints.append(f"Cold pixel EF = {cold_stats['EF']:.3f} < 0.95")
+        
+        # Cold pixel: LE_cold ≤ (Rn_cold − G_cold)
+        if cold_stats['LE'] > (cold_stats['Rn'] - cold_stats['G']):
+            rejected_constraints.append(f"Cold pixel LE = {cold_stats['LE']:.1f} > (Rn - G) = {cold_stats['Rn'] - cold_stats['G']:.1f}")
+        
+        # Validate hot pixel constraints
+        # Hot pixel: H_hot ≥ 100 W/m²
+        if hot_stats['H'] < 100.0:
+            rejected_constraints.append(f"Hot pixel H = {hot_stats['H']:.1f} W/m² < 100 W/m²")
+        
+        # Hot pixel: EF_hot ≤ 0.30
+        if hot_stats['EF'] > 0.30:
+            rejected_constraints.append(f"Hot pixel EF = {hot_stats['EF']:.3f} > 0.30")
+        
+        # Hot pixel: dT_hot ≥ 8 K
+        if hot_stats['dT'] < 8.0:
+            rejected_constraints.append(f"Hot pixel dT = {hot_stats['dT']:.1f} K < 8 K")
+        
+        # Log validation results
+        logger.info("Cold pixel statistics (median of candidates):")
+        logger.info(f"  dT = {cold_stats['dT']:.3f} K (|dT| ≤ 0.3 K)")
+        logger.info(f"  H = {cold_stats['H']:.1f} W/m² (H ≤ 30 W/m²)")
+        logger.info(f"  EF = {cold_stats['EF']:.3f} (EF ≥ 0.95)")
+        logger.info(f"  LE = {cold_stats['LE']:.1f} W/m² ≤ Rn-G = {cold_stats['Rn'] - cold_stats['G']:.1f} W/m²")
+        
+        logger.info("Hot pixel statistics (median of candidates):")
+        logger.info(f"  dT = {hot_stats['dT']:.1f} K (dT ≥ 8 K)")
+        logger.info(f"  H = {hot_stats['H']:.1f} W/m² (H ≥ 100 W/m²)")
+        logger.info(f"  EF = {hot_stats['EF']:.3f} (EF ≤ 0.30)")
+        
+        validation_passed = len(rejected_constraints) == 0
+        
+        if not validation_passed:
+            logger.error("PHYSICS VALIDATION FAILED - Calibration rejected:")
+            for constraint in rejected_constraints:
+                logger.error(f"  - {constraint}")
+            raise ValueError(f"Anchor pixel physics validation failed: {rejected_constraints}")
+        
+        logger.info("PHYSICS VALIDATION PASSED - All constraints satisfied")
+        
+        return {
+            'cold_stats': cold_stats,
+            'hot_stats': hot_stats,
+            'validation_passed': validation_passed,
+            'rejected_constraints': rejected_constraints
+        }
 
 
 __all__ = ['AnchorPixel', 'AnchorPixelsResult', 'AnchorPixelSelector']

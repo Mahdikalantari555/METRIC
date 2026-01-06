@@ -12,6 +12,7 @@ output_dir: output/
 
 # Processing parameters
 cloud_threshold: 30
+qa_coverage_threshold: 0.70  # Minimum fraction of valid pixels required for processing
 
 # Calibration settings
 calibration:
@@ -34,7 +35,18 @@ visualization:
   dpi: 300
   show_plots: false
 
+# Weather data settings
+weather:
+  cache:
+    enabled: true
+    directory: "cache"
+    max_size_mb: 1000
+    cleanup_interval_days: 30
+    max_age_days: 365
+
 # Logging settings
 logging:
   level: INFO
   file: metric_et.log
+
+  

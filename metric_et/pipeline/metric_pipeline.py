@@ -4,6 +4,10 @@ from typing import Dict, Optional, Tuple, Union, Any
 import numpy as np
 import xarray as xr
 from loguru import logger
+import os
+
+# Import decision logic from calibration
+from ..calibration.dt_calibration import CalibrationStatus
 
 
 class METRICPipeline:
@@ -16,6 +20,12 @@ class METRICPipeline:
         self.data = None
         self._calibration_result = None
         self._eb_manager = None  # Store EnergyBalanceManager instance for reuse
+        self._scene_quality = "GOOD"  # Track scene quality based on calibration decision
+        self._scene_id = "unknown"  # Track current scene ID
+        self._qa_coverage_issue = False  # Track QA coverage issues for quality flagging
+        self._original_extent = None     # Store original scene extent before clipping
+        self._roi_extent = None          # Store ROI extent after clipping
+        self._roi_mask = None            # Store boolean mask for ROI boundaries
         logger.info("Initialized METRICPipeline")
     
     def run(
@@ -35,6 +45,11 @@ class METRICPipeline:
             self.load_data(landsat_dir, meteo_data, roi_path=roi_path)
             self.preprocess()
 
+            # Extract scene ID from DataCube metadata (from MTL.json)
+            scene_id = self.data.metadata.get('scene_id', os.path.basename(landsat_dir.strip('/\\')))
+            self._scene_id = scene_id
+            logger.info(f"Processing scene: {scene_id}")
+
             # Step 2: Calculate surface properties
             logger.info("Step 2: Calculating surface properties")
             self.calculate_surface_properties()
@@ -47,19 +62,31 @@ class METRICPipeline:
             logger.info("Step 4: Calculating soil heat flux")
             self.calculate_soil_heat_flux()
 
-            # Step 5: Apply METRIC calibration (needs Rn-G for anchor selection)
-            logger.info("Step 5: Applying METRIC calibration")
+            # Step 5: Apply unified METRIC calibration pipeline
+            logger.info("Step 5: Applying unified METRIC calibration pipeline")
             self.calibrate()
 
-            # Step 6: Calculate final energy balance (H, LE) with calibration
-            logger.info("Step 6: Calculating energy balance with calibration")
-            self.calculate_energy_balance()
+            # Check if scene was rejected by decision logic
+            # NOTE: We now allow all scenes to proceed to ET calculation
+            # Only severe QA issues (< 0.30) should reject scenes
+            if self._scene_quality == "REJECTED":
+                logger.warning(
+                    f"Scene {self._scene_id} was rejected during calibration. "
+                    "However, proceeding with ET calculation for quality assessment."
+                )
+                # Continue to ET calculation instead of returning early
+            
+            # Check for QA coverage issues and flag as LOW QUALITY if needed
+            if hasattr(self, '_qa_coverage_issue') and self._qa_coverage_issue:
+                if self._scene_quality == "GOOD":
+                    self._scene_quality = "LOW_QUALITY"
+                    logger.info(f"Scene {self._scene_id} flagged as LOW QUALITY due to QA coverage issues")
 
-            # Step 7: Calculate final ET
-            logger.info("Step 7: Calculating evapotranspiration")
+            # Step 6: Calculate final ET
+            logger.info("Step 6: Calculating evapotranspiration")
             self.calculate_et()
 
-            # Step 8: Save results if output directory provided
+            # Step 7: Save results if output directory provided
             if output_dir:
                 logger.info("Step 8: Saving results")
                 self.save_results(output_dir)
@@ -92,32 +119,23 @@ class METRICPipeline:
             landsat_reader = LandsatReader()
             landsat_cube = landsat_reader.load(landsat_dir)
 
-            # Load ROI and clip Landsat data to ROI
+            # Load ROI geometry for later use in final clipping (not for initial data loading)
             roi_path = roi_path or self.roi_path or "amirkabir.geojson"
             import geopandas as gpd
-            import rioxarray
             roi_gdf = gpd.read_file(roi_path)
-            # Reproject ROI to match raster CRS
-            sample_band = next(iter(landsat_cube.data.values()))
-            roi_gdf = roi_gdf.to_crs(sample_band.rio.crs)
-            roi_geom = roi_gdf.geometry.iloc[0]  # assuming single feature
-            logger.info("Loaded and reprojected ROI from amirkabir.geojson")
-
-            # Clip all Landsat bands to ROI
-            for band_name in landsat_cube.bands():
-                band_data = landsat_cube.get(band_name)
-                clipped = band_data.rio.clip([roi_geom], crs=band_data.rio.crs, drop=False)
-                landsat_cube.add(band_name, clipped)
-
-            # Update extent and transform based on clipped data
-            sample_clipped = landsat_cube.get(next(iter(landsat_cube.bands())))
-            landsat_cube.extent = sample_clipped.rio.bounds()
-            landsat_cube.transform = sample_clipped.rio.transform()
-            logger.info("Clipped Landsat data to ROI")
+            # Reproject ROI to match raster CRS from DataCube
+            roi_gdf = roi_gdf.to_crs(landsat_cube.crs)
+            self._roi_geom = roi_gdf.geometry.iloc[0]  # Store ROI geometry for later use
+            logger.info("Loaded ROI geometry for final clipping")
 
             # Copy Landsat data to main cube
             for band_name in landsat_cube.bands():
-                self.data.add(band_name, landsat_cube.get(band_name))
+                band_data = landsat_cube.get(band_name)
+                # Ensure rioxarray integration is available for spatial operations
+                if not hasattr(band_data, 'rio'):
+                    import rioxarray
+                    band_data = band_data.rio.write_crs(landsat_cube.crs)
+                self.data.add(band_name, band_data)
 
             # Copy metadata
             self.data.metadata.update(landsat_cube.metadata)
@@ -140,24 +158,28 @@ class METRICPipeline:
             sample_band = next(iter(self.data.data.values()))
             target_coords = {dim: sample_band.coords[dim] for dim in sample_band.dims}
 
-            # Get actual processed extent (clipped to ROI) and convert to lat/lon
-            projected_bounds = self.data.extent  # (min_x, min_y, max_x, max_y) in projected CRS
+            # Get full scene extent and convert to lat/lon for weather fetching
+            full_scene_bounds = self.data.extent  # (min_x, min_y, max_x, max_y) in projected CRS
             from pyproj import Transformer
             # Create transformer from data CRS to WGS84
             transformer = Transformer.from_crs(self.data.crs, "EPSG:4326", always_xy=True)
             # Transform corners
-            min_lon, min_lat = transformer.transform(projected_bounds[0], projected_bounds[1])
-            max_lon, max_lat = transformer.transform(projected_bounds[2], projected_bounds[3])
-            actual_extent = (min_lon, min_lat, max_lon, max_lat)
+            min_lon, min_lat = transformer.transform(full_scene_bounds[0], full_scene_bounds[1])
+            max_lon, max_lat = transformer.transform(full_scene_bounds[2], full_scene_bounds[3])
+            full_scene_extent = (min_lon, min_lat, max_lon, max_lat)
 
-            # Initialize dynamic weather fetcher
+            # Initialize dynamic weather fetcher with cache settings
             from ..io.dynamic_weather_fetcher import DynamicWeatherFetcher
-            weather_fetcher = DynamicWeatherFetcher()
+            weather_config = self.config.get('weather', {}).get('cache', {})
+            weather_fetcher = DynamicWeatherFetcher(
+                enable_cache=weather_config.get('enabled', True),
+                cache_dir=weather_config.get('directory', 'cache')
+            )
 
             try:
-                # Fetch spatially varying weather data using actual extent
+                # Fetch spatially varying weather data using full scene extent
                 weather_arrays = weather_fetcher.fetch_weather_for_scene(
-                    landsat_dir, target_coords, actual_extent
+                    landsat_dir, target_coords, full_scene_extent
                 )
 
                 # Convert temperature from Celsius to Kelvin
@@ -168,7 +190,7 @@ class METRICPipeline:
                 for var_name, array in weather_arrays.items():
                     self.data.add(var_name, array)
 
-                logger.info(f"Spatially varying weather data loaded for {len(weather_arrays)} variables using ROI extent")
+                logger.info(f"Spatially varying weather data loaded for {len(weather_arrays)} variables using full scene extent")
 
             except Exception as e:
                 logger.error(f"Failed to fetch dynamic weather data: {e}")
@@ -196,32 +218,43 @@ class METRICPipeline:
 
             logger.info("Starting preprocessing")
 
-            # Apply cloud masking
-            logger.info("Applying cloud masking")
-            from ..preprocess.cloud_mask import CloudMasker
-            
-            # Use high confidence threshold to be conservative
-            masker = CloudMasker(
-                cloud_confidence_threshold=CloudMasker.CONFIDENCE_HIGH,
-                dilate_pixels=3,
-                include_snow=False,
-                include_water=True
-            )
-            
-            # Create cloud mask from QA pixel band
+            # Step 1.5: Clip to ROI first
+            logger.info("Step 1.5: Clipping scene bands to ROI boundary")
+            self.clip_to_roi()
+
+            # Step 1.6: Apply cloud masking to clipped scene
+            logger.info("Step 1.6: Applying cloud masking to clipped scene")
             qa_pixel = self.data.get('qa_pixel')
             if qa_pixel is not None:
+                from ..preprocess.cloud_mask import CloudMasker
+                masker = CloudMasker(
+                    cloud_confidence_threshold=CloudMasker.CONFIDENCE_HIGH,
+                    dilate_pixels=3,
+                    include_snow=False,
+                    include_water=True
+                )
                 cloud_mask = masker.create_mask(qa_pixel)
-                logger.info(f"Cloud mask created: {np.sum(cloud_mask)} clear pixels out of {cloud_mask.size}")
-                
+
                 # Apply mask to all bands
                 masked_cube = masker.apply_mask(self.data, cloud_mask, fill_value=np.nan)
-                
+
                 # Replace original data with masked data
                 self.data = masked_cube
-                logger.info("Cloud masking applied successfully")
+                logger.info("Cloud masking applied to clipped scene")
             else:
                 logger.warning("No QA pixel band found, skipping cloud masking")
+
+            # Step 1.7: Calculate cloud coverage fraction on clipped scene
+            logger.info("Step 1.7: Calculating cloud coverage fraction on clipped scene")
+            if qa_pixel is not None:
+                masked_pixels = np.sum(cloud_mask)
+                total_pixels = cloud_mask.size
+                self._cloud_coverage = masked_pixels / total_pixels
+                self._masked_pixels = masked_pixels
+                self._total_pixels = total_pixels
+                logger.info(f"Cloud coverage calculated on clipped scene: {masked_pixels}/{total_pixels} = {self._cloud_coverage:.3f}")
+            else:
+                logger.warning("No QA pixel band found for cloud coverage calculation")
 
             # TODO: Add additional preprocessing steps as needed
             # - Resampling
@@ -233,6 +266,176 @@ class METRICPipeline:
         except Exception as e:
             logger.error(f"Error in preprocessing: {e}")
             raise
+    
+    def clip_to_roi(self) -> None:
+        """Clip spatial scene bands to ROI boundary during preprocessing.
+        
+        This method clips only the spatial Landsat bands (similar to cloud masking) to the ROI boundary
+        early in the preprocessing workflow, ensuring all subsequent calculations
+        run on the smaller, clipped dataset for computational efficiency.
+        
+        Weather data (spatially uniform) is not clipped since it doesn't have spatial extent.
+        """
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        
+        try:
+            if self.data is None:
+                raise ValueError("No data loaded. Call load_data() first.")
+            
+            if not hasattr(self, '_roi_geom'):
+                logger.warning("No ROI geometry available, skipping ROI clipping")
+                return
+            
+            logger.info("Clipping spatial scene bands to ROI boundary")
+            
+            # Get list of all bands in the data cube
+            all_bands = self.data.bands()
+            clipped_bands = []
+            skipped_bands = []
+            
+            for band_name in all_bands:
+                band_data = self.data.get(band_name)
+                
+                # Skip bands that don't have CRS (spatially uniform data like weather)
+                if not hasattr(band_data, 'rio') or band_data.rio.crs is None:
+                    logger.debug(f"Skipping {band_name} - no spatial CRS (spatially uniform data)")
+                    skipped_bands.append(band_name)
+                    continue
+                
+                # Ensure rioxarray integration is available for spatial operations
+                if not hasattr(band_data, 'rio'):
+                    import rioxarray
+                    band_data = band_data.rio.write_crs(self.data.crs)
+                
+                # Check if CRS is available
+                if band_data.rio.crs is None:
+                    logger.debug(f"Skipping {band_name} - no CRS available")
+                    skipped_bands.append(band_name)
+                    continue
+                
+                try:
+                    # Clip to ROI geometry
+                    clipped_band = band_data.rio.clip(
+                        [self._roi_geom], 
+                        crs=band_data.rio.crs, 
+                        drop=False
+                    )
+                    
+                    # Replace original band with clipped version
+                    self.data.add(band_name, clipped_band)
+                    clipped_bands.append(band_name)
+                    
+                    logger.debug(f"Clipped {band_name} to ROI")
+                except Exception as e:
+                    logger.warning(f"Failed to clip {band_name}: {e}")
+                    skipped_bands.append(band_name)
+                    continue
+            
+            if clipped_bands:
+                logger.info(f"Clipped {len(clipped_bands)} spatial bands to ROI: {clipped_bands}")
+                
+                if skipped_bands:
+                    logger.info(f"Skipped {len(skipped_bands)} non-spatial bands: {skipped_bands}")
+                
+                # Update data extent and transform based on clipped data
+                sample_clipped = self.data.get(clipped_bands[0])
+                if hasattr(sample_clipped, 'rio'):
+                    self.data.extent = sample_clipped.rio.bounds()
+                    self.data.transform = sample_clipped.rio.transform()
+                else:
+                    # Fallback if rioxarray is not available
+                    logger.warning("rioxarray not available for extent update")
+                
+                logger.info(f"Updated data extent to ROI boundaries: {self.data.extent}")
+                
+                # Calculate actual pixel counts from first clipped band
+                sample_band = self.data.get(clipped_bands[0])
+                if hasattr(sample_band, 'shape'):
+                    clipped_pixels = np.prod(sample_band.shape)
+                    logger.info(f"ROI clipping completed: working with {clipped_pixels} pixels in clipped area")
+                    logger.info(f"Original extent: {self._original_extent}")
+                    logger.info(f"ROI extent: {self._roi_extent}")
+                
+                # Store clipping information for enhanced QA coverage calculation
+                # Store the original extent before clipping (from initial data loading)
+                if not hasattr(self, '_original_extent') or self._original_extent is None:
+                    self._original_extent = self.data.extent  # This is the original extent before clipping
+                self._roi_extent = self.data.extent
+                self._roi_mask = self._create_roi_mask_from_clipped_data(sample_band)
+                
+            else:
+                logger.warning("No spatial bands found to clip")
+                if skipped_bands:
+                    logger.info(f"All bands were non-spatial: {skipped_bands}")
+                
+        except Exception as e:
+            logger.error(f"Error clipping to ROI: {e}")
+            raise
+    
+    def _create_roi_mask_from_clipped_data(self, sample_band) -> np.ndarray:
+        """
+        Create boolean mask indicating which pixels are within ROI boundaries.
+        
+        Args:
+            sample_band: Sample band data to extract coordinate information
+            
+        Returns:
+            Boolean mask array where True indicates pixels within ROI boundaries
+        """
+        try:
+            # Create mask based on non-NaN values in the clipped band
+            # This represents the actual ROI area after clipping
+            if hasattr(sample_band, 'values'):
+                roi_mask = ~np.isnan(sample_band.values)
+            else:
+                roi_mask = ~np.isnan(sample_band)
+            
+            logger.debug(f"Created ROI mask: {np.sum(roi_mask)} valid pixels out of {roi_mask.size}")
+            return roi_mask
+            
+        except Exception as e:
+            logger.warning(f"Failed to create ROI mask: {e}")
+            # Fallback: create full mask if coordinates not available
+            if hasattr(sample_band, 'shape'):
+                return np.ones(sample_band.shape, dtype=bool)
+            else:
+                return np.array([True])
+    
+    def calculate_qa_coverage_enhanced(self, ndvi: xr.DataArray) -> Tuple[float, int, int]:
+        """
+        Calculate QA coverage counting only cloud-masked pixels as loss.
+        
+        This method counts only pixels removed by cloud masking as pixel loss,
+        not clipped boundary regions. The calculation is:
+        - Total pixels: All pixels in the scene
+        - Valid pixels: Pixels not masked by clouds (NaN values from cloud masking)
+        
+        Args:
+            ndvi: NDVI array for QA coverage calculation
+            
+        Returns:
+            Tuple of (valid_pixel_fraction, valid_pixels, total_pixels)
+            where only cloud-masked pixels count as loss
+        """
+        try:
+            # Count valid pixels (not NaN from cloud masking)
+            valid_pixels = np.sum(~np.isnan(ndvi.values))
+            total_pixels = ndvi.size
+            
+            # Calculate QA coverage
+            qa_coverage = valid_pixels / total_pixels
+            
+            logger.debug(f"Cloud-mask QA calculation: {valid_pixels}/{total_pixels} = {qa_coverage:.3f}")
+            return qa_coverage, valid_pixels, total_pixels
+            
+        except Exception as e:
+            logger.error(f"Error in cloud-mask QA calculation: {e}")
+            # Fallback to original behavior on error
+            valid_pixels = np.sum(~np.isnan(ndvi.values))
+            total_pixels = ndvi.size
+            return valid_pixels / total_pixels, valid_pixels, total_pixels
     
     def calculate_surface_properties(self) -> None:
         """Calculate surface properties."""
@@ -315,6 +518,132 @@ class METRICPipeline:
         except Exception as e:
             logger.error(f"Error calculating radiation balance: {e}")
             raise
+
+    def validate_scene(self) -> Tuple[bool, str]:
+        """Perform scene-level pre-validation (HARD REJECT) checks.
+
+        Returns:
+            Tuple of (rejected: bool, reason: str)
+            If rejected is True, the scene should be rejected with the given reason.
+        """
+        import logging
+        from ..core.constants import MJ_M2_DAY_TO_W
+
+        logger = logging.getLogger(__name__)
+
+        try:
+            if self.data is None:
+                raise ValueError("No data loaded. Call load_data() first.")
+
+            logger.info("Performing scene-level pre-validation checks")
+
+            rejected = False
+            reason = ""
+
+            # Get required data
+            ndvi = self.data.get("ndvi")
+            rn = self.data.get("R_n")
+            et0_daily_array = self.data.get("et0_fao_evapotranspiration")
+            rs_inst_array = self.data.get("shortwave_radiation")
+            rs_daily_array = self.data.get("shortwave_radiation_sum")
+
+            if ndvi is None:
+                return True, "NDVI data not available for validation"
+            if rn is None:
+                return True, "Net radiation (R_n) not available for validation"
+            if et0_daily_array is None or rs_inst_array is None or rs_daily_array is None:
+                return True, "Weather data not available for ET0_inst calculation"
+
+            # 1. Cloud coverage check: use cloud coverage fraction instead of QA coverage
+            # This uses the cloud coverage calculated during preprocessing
+            if not hasattr(self, '_cloud_coverage'):
+                logger.warning("Cloud coverage not calculated during preprocessing, skipping cloud coverage check")
+                cloud_coverage = 0.0
+            else:
+                cloud_coverage = self._cloud_coverage
+
+            # Get cloud coverage thresholds from config
+            # Reject if >70% cloud coverage (cloud_reject_threshold = 0.70)
+            # Flag as LOW QUALITY if >30% cloud coverage (cloud_low_quality_threshold = 0.30)
+            cloud_reject_threshold = self.config.get('cloud_reject_threshold', 0.70)
+            cloud_low_quality_threshold = self.config.get('cloud_low_quality_threshold', 0.30)
+
+            logger.info(f"Cloud coverage: {cloud_coverage:.3f}")
+            logger.info(f"Thresholds - Reject: >{cloud_reject_threshold:.2f}, Low Quality: >{cloud_low_quality_threshold:.2f}")
+
+            if cloud_coverage > cloud_reject_threshold:
+                # Reject if more than 70% cloud coverage
+                rejected = True
+                reason = f"Cloud coverage too high: {cloud_coverage:.3f} > {cloud_reject_threshold:.2f}"
+                logger.error(reason)
+                return rejected, reason
+            elif cloud_coverage > cloud_low_quality_threshold:
+                # Flag as LOW QUALITY if more than 30% cloud coverage
+                logger.warning(f"Cloud coverage indicates moderate cloud cover: {cloud_coverage:.3f} > {cloud_low_quality_threshold:.2f} - flagging as LOW QUALITY")
+                # Store this information for later quality flagging
+                self._qa_coverage_issue = True
+                # Don't return here - continue with processing but will be flagged as LOW QUALITY later
+
+            # 2. NDVI dynamic range check: NDVI_p95 - NDVI_p05 < 0.30
+            ndvi_values = ndvi.values[~np.isnan(ndvi.values)]
+            if len(ndvi_values) == 0:
+                return True, "No valid NDVI values for dynamic range check"
+
+            ndvi_p5 = np.percentile(ndvi_values, 5)
+            ndvi_p95 = np.percentile(ndvi_values, 95)
+            ndvi_range = ndvi_p95 - ndvi_p5
+
+            logger.info(f"NDVI dynamic range: P95={ndvi_p95:.3f}, P5={ndvi_p5:.3f}, range={ndvi_range:.3f}")
+
+            if ndvi_range < 0.30:
+                rejected = True
+                reason = f"NDVI dynamic range too low: {ndvi_range:.3f} < 0.30"
+                logger.warning(reason)
+                return rejected, reason
+
+            # 3. Net radiation sanity check: median(Rn) < 300 W/m²
+            rn_values = rn.values[~np.isnan(rn.values)]
+            if len(rn_values) == 0:
+                return True, "No valid Rn values for median check"
+
+            rn_median = np.median(rn_values)
+
+            logger.info(f"Net radiation median: {rn_median:.1f} W/m²")
+
+            if rn_median < 300:
+                rejected = True
+                reason = f"Net radiation median too low: {rn_median:.1f} < 300 W/m²"
+                logger.warning(reason)
+                return rejected, reason
+
+            # 4. ET0_inst sanity check: ET0_inst < 0.2 or > 1.0 mm/hr
+            # Calculate ET0_inst similar to calibration
+            et0_daily = float(np.nanmean(et0_daily_array.values))
+            rs_inst = float(np.nanmean(rs_inst_array.values))
+            rs_daily = float(np.nanmean(rs_daily_array.values))
+
+            rs_daily_avg_w = rs_daily * MJ_M2_DAY_TO_W  # MJ/m²/day -> W/m²
+
+            if rs_daily_avg_w <= 0:
+                return True, "Invalid daily shortwave radiation for ET0_inst calculation"
+
+            radiation_ratio = rs_inst / rs_daily_avg_w
+            et0_inst = et0_daily * radiation_ratio  # mm/day-equivalent
+
+            logger.info(f"ET0_inst: {et0_inst:.3f} mm/day-equiv")
+
+            if et0_inst < 5.0 or et0_inst > 40.0:
+                rejected = True
+                reason = f"ET0_inst out of range: {et0_inst:.3f} mm/day-equiv (must be 5-40)"
+                logger.warning(reason)
+                return rejected, reason
+
+            logger.info("Scene-level pre-validation passed")
+            return False, ""
+
+        except Exception as e:
+            logger.error(f"Error in scene validation: {e}")
+            return True, f"Validation error: {str(e)}"
     
     def calculate_soil_heat_flux(self) -> None:
         """Calculate soil heat flux (G) independently of calibration.
@@ -516,7 +845,7 @@ class METRICPipeline:
         return default_et0
     
     def calibrate(self) -> None:
-        """Apply METRIC calibration."""
+        """Apply unified METRIC calibration pipeline with decision logic and logging."""
         from ..calibration import AnchorPixelSelector, DTCalibration
         from ..energy_balance import EnergyBalanceManager
         import logging
@@ -527,79 +856,65 @@ class METRICPipeline:
             if self.data is None:
                 raise ValueError("No data loaded. Call load_data() first.")
 
-            logger.info("Starting METRIC calibration")
+            logger.info("Starting unified METRIC calibration pipeline")
 
-            # Select anchor pixels using enhanced physical method with Rn-G optimization
+            # Initialize or reuse energy balance manager
+            if self._eb_manager is None:
+                self._eb_manager = EnergyBalanceManager()
+
+            # Select anchor pixel selector
             calibration_config = self.config.get('calibration', {})
             method = calibration_config.get('method', 'enhanced_physical')
-            
-            # Check if Rn and G are available for energy-based selection
-            rn = self.data.get("R_n")
-            g_flux = self.data.get("G")
-            
-            if rn is None or g_flux is None:
-                raise ValueError("Rn and G must be computed before anchor pixel selection. "
-                               "Check radiation balance and soil heat flux calculations.")
             
             if method == 'enhanced_physical':
                 # Use enhanced selector which needs DataCube with Rn and G
                 from ..calibration.anchor_pixels_enhanced import EnhancedAnchorPixelSelector
                 anchor_selector = EnhancedAnchorPixelSelector()
-                
-                # Perform anchor pixel selection with energy-based optimization
-                anchor_result = anchor_selector.select_anchor_pixels(
-                    cube=self.data,
-                    rn=rn.values,
-                    g_flux=g_flux.values
-                )
             else:
                 # Use standard selector with arrays
                 anchor_selector = AnchorPixelSelector(method=method)
-                anchor_result = anchor_selector.select_anchor_pixels(
-                    ts=self.data.get("lst").values,
-                    ndvi=self.data.get("ndvi").values if self.data.get("ndvi") is not None else None,
-                    albedo=self.data.get("albedo").values if self.data.get("albedo") is not None else None
-                )
 
-            # Debug logging for anchor result
-            logger.info(f"anchor_result type: {type(anchor_result)}")
-            logger.info(f"cold_pixel type: {type(anchor_result.cold_pixel)}")
-            logger.info(f"cold_pixel attributes: {dir(anchor_result.cold_pixel)}")
-            if hasattr(anchor_result.cold_pixel, 'temperature'):
-                logger.info(f"cold_pixel.temperature: {anchor_result.cold_pixel.temperature}")
-            else:
-                logger.info("cold_pixel has no 'temperature' attribute")
-            if hasattr(anchor_result.cold_pixel, 'ts'):
-                logger.info(f"cold_pixel.ts: {anchor_result.cold_pixel.ts}")
-            else:
-                logger.info("cold_pixel has no 'ts' attribute")
-
-            # Get ET0_daily for METRIC calibration reference
-            # METRIC uses ET0_daily directly - no instantaneous ET0 estimation needed
-            et0_daily_value = self._get_et0_daily()
-            
-            # Use improved method for air temperature
-            air_temperature = self._get_air_temperature()
-
+            # Execute unified calibration pipeline
             calibrator = DTCalibration.create()
-            calibration = calibrator.calibrate_from_anchors(self.data, anchor_result)
+            calibration = calibrator.unified_calibration_pipeline(
+                cube=self.data,
+                scene_id=self._scene_id,
+                energy_balance_manager=self._eb_manager,
+                anchor_pixel_selector=anchor_selector,
+                validation_config=calibration_config
+            )
 
-            # Store calibration result for later use in output writing
+            # Store calibration result for later use
             self._calibration_result = calibration
+            self._scene_quality = calibration.scene_quality
 
-            # Reuse the same energy balance manager instance for state consistency
-            if self._eb_manager is None:
-                self._eb_manager = EnergyBalanceManager()
-                
-            self._eb_manager.set_anchor_pixel_calibration(calibration.a_coefficient, calibration.b_coefficient)
+            # Check decision result
+            if calibration.status == CalibrationStatus.REJECTED:
+                # Case 3: No valid calibration and no fallback - reject scene
+                logger.error(
+                    f"Scene {self._scene_id} REJECTED: {calibration.rejection_reason}. "
+                    "No ET outputs will be produced."
+                )
+                return  # Exit without producing ET outputs
 
-            # Recalculate energy balance with calibration
-            eb_results = self._eb_manager.calculate(self.data)
+            # For ACCEPTED or REUSED status, ensure energy balance is calculated
+            # The unified pipeline should have already calculated it, but ensure it's available
+            if self.data.get("H") is None or self.data.get("LE") is None:
+                logger.info("Recalculating energy balance with final calibration")
+                self._eb_manager.set_anchor_pixel_calibration(
+                    calibration.a_coefficient, calibration.b_coefficient
+                )
+                eb_results = self._eb_manager.calculate(self.data)
 
-            logger.info("METRIC calibration completed")
+            logger.info(f"Unified METRIC calibration completed with status: {calibration.status.value}")
+            logger.info(f"  Pre-validation: {calibration.prevalidation_passed}")
+            logger.info(f"  Anchor physics: {calibration.anchor_physics_valid}")
+            logger.info(f"  Global validation: {calibration.global_validation_passed}")
+            if calibration.global_violations:
+                logger.warning(f"  Global violations: {calibration.global_violations}")
 
         except Exception as e:
-            logger.error(f"Error in METRIC calibration: {e}")
+            logger.error(f"Error in unified METRIC calibration: {e}")
             raise
     
     def calculate_et(self) -> None:
@@ -703,15 +1018,8 @@ class METRICPipeline:
             logger.info("Step 1: Calculating instantaneous ET from energy balance")
             logger.info("Formula: ET_inst = LE / (ρ × λ) where LE is latent heat flux")
 
-            # Calculate instantaneous ET - still need ETrF for daily scaling
-            # Use ET0_daily as reference for ETrF calculation
-            et0_daily_data = self.data.get("et0_fao_evapotranspiration")
-            # Convert ET0_daily to ET0_inst for ETrF calculation
-            et0_inst_for_etrf = et0_daily_data / 12.0  # mm/day → mm/hr
-            inst_et_result = inst_et_calc.calculate(
-                le=self.data.get("LE"),
-                etr_inst=et0_inst_for_etrf    # Use ET0_daily in mm/hr for ETrF calculation 
-            )
+            # Calculate instantaneous ET from LE
+            inst_et_result = inst_et_calc.calculate(le=self.data.get("LE"))
 
             # Log instantaneous ET results
             if "ET_inst" in inst_et_result:
@@ -721,23 +1029,26 @@ class METRICPipeline:
                 logger.info(f"  Range: [{np.min(valid_et_inst):.6f}, {np.max(valid_et_inst):.6f}] mm/hr")
                 logger.info(f"  Mean: {np.mean(valid_et_inst):.6f} mm/hr, Std: {np.std(valid_et_inst):.6f} mm/hr")
 
-            if "ETrF" in inst_et_result:
-                etrf_values = inst_et_result["ETrF"]
+            # Add instantaneous ET to data
+            self.data.add("ET_inst", inst_et_result["ET_inst"])
+
+            # Set ETrF = EF (METRIC standard: ETrF ≈ EF)
+            ef = self.data.get("EF")
+            if ef is not None:
+                self.data.add("ETrF", ef)
+                etrf_values = ef.values
                 valid_etrf = etrf_values[~np.isnan(etrf_values)]
-                logger.info(f"ETrF results: {len(valid_etrf)} valid pixels")
+                logger.info(f"ETrF set to EF: {len(valid_etrf)} valid pixels")
                 logger.info(f"  Range: [{np.min(valid_etrf):.6f}, {np.max(valid_etrf):.6f}]")
                 logger.info(f"  Mean: {np.mean(valid_etrf):.6f}, Std: {np.std(valid_etrf):.6f}")
 
                 # Check for unrealistic ETrF values
-                if np.max(valid_etrf) > 1.5:
-                    logger.warning(f"WARNING: ETrF maximum ({np.max(valid_etrf):.3f}) exceeds typical range [0, 1.2]")
+                if np.max(valid_etrf) > 1.0:
+                    logger.warning(f"WARNING: ETrF maximum ({np.max(valid_etrf):.3f}) exceeds 1.0")
                 if np.min(valid_etrf) < 0:
                     logger.warning(f"WARNING: ETrF minimum ({np.min(valid_etrf):.3f}) is negative")
-
-            # Add instantaneous ET to data
-            self.data.add("ET_inst", inst_et_result["ET_inst"])
-            if "ETrF" in inst_et_result:
-                self.data.add("ETrF", inst_et_result["ETrF"])
+            else:
+                logger.warning("EF not available, cannot set ETrF")
 
             logger.info("=== STARTING DAILY ET CALCULATION ===")
 
@@ -827,6 +1138,32 @@ class METRICPipeline:
 
         return results
 
+    def get_scene_quality(self) -> Dict[str, Any]:
+        """
+        Get scene quality information based on calibration decision.
+
+        Returns:
+            Dictionary with scene quality and calibration status information
+        """
+        if self._calibration_result is None:
+            return {
+                "quality": "UNKNOWN",
+                "status": "NO_CALIBRATION",
+                "scene_id": self._scene_id
+            }
+
+        return {
+            "quality": self._scene_quality,
+            "status": self._calibration_result.status.value,
+            "scene_id": self._scene_id,
+            "a_coefficient": self._calibration_result.a_coefficient,
+            "b_coefficient": self._calibration_result.b_coefficient,
+            "timestamp": self._calibration_result.timestamp,
+            "rejection_reason": self._calibration_result.rejection_reason,
+            "reuse_source": self._calibration_result.reuse_source,
+            "valid": self._calibration_result.valid
+        }
+
     def save_results(self, output_dir: str) -> None:
         """Save results to output directory."""
         from ..output import OutputWriter, Visualization
@@ -865,7 +1202,16 @@ class METRICPipeline:
                     ts_cold=0.0, ts_hot=0.0,
                     air_temperature=293.15,
                     etr_inst=0.0,
-                    valid=True, errors=[]
+                    valid=True, errors=[],
+                    # NEW: Anchor pixel metadata fields with defaults
+                    cold_pixel_ndvi=np.nan,
+                    cold_pixel_albedo=np.nan,
+                    hot_pixel_ndvi=np.nan,
+                    hot_pixel_albedo=np.nan,
+                    cold_pixel_x=0,
+                    cold_pixel_y=0,
+                    hot_pixel_x=0,
+                    hot_pixel_y=0
                 )
             
             # Write ET products
@@ -878,7 +1224,7 @@ class METRICPipeline:
             # Create visualizations
             viz = Visualization(output_dir=output_dir)
             overview_filename = f"overview_{date_str}.png"
-            viz.create_summary_figure(self.data, os.path.join(output_dir, overview_filename))
+            viz.create_summary_figure(self.data, os.path.join(output_dir, overview_filename), calibration_result=actual_calibration)
             if self.data.get('ET_daily') is not None:
                 et_map_filename = f"et_map_{date_str}.png"
                 viz.plot_et_map(
@@ -898,3 +1244,28 @@ class METRICPipeline:
         except Exception as e:
             logger.error(f"Error saving results: {e}")
             raise
+    
+    def clip_outputs_to_aoi(self) -> None:
+        """Clip final ET outputs to AOI boundary.
+        
+        DEPRECATED: This method is no longer used since ROI clipping is now performed
+        during preprocessing (Step 1.5) using clip_to_roi(). All subsequent calculations
+        run on the already-clipped data, so no final output clipping is needed.
+        
+        This method is kept for backward compatibility but is now a no-op.
+        """
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        
+        try:
+            if self.data is None:
+                raise ValueError("No data available. Run the pipeline first.")
+            
+            logger.info("ROI clipping is now performed during preprocessing - no final output clipping needed")
+            logger.info("All data is already clipped to ROI boundaries from preprocessing step")
+            
+        except Exception as e:
+            logger.error(f"Error in clip_outputs_to_aoi: {e}")
+            # Don't raise exception to avoid breaking the pipeline
+            logger.warning("Continuing pipeline execution")

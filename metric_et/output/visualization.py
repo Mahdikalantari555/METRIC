@@ -549,15 +549,17 @@ class Visualization:
         self,
         cube: DataCube,
         output_path: Optional[str] = None,
-        show: bool = False
+        show: bool = False,
+        calibration_result: Optional[Any] = None
     ) -> Optional[str]:
         """Create summary figure with multiple panels.
-        
+
         Args:
             cube: DataCube containing ET products
             output_path: Output file path
             show: Whether to display the plot
-            
+            calibration_result: Calibration result containing anchor pixel coordinates
+
         Returns:
             Output file path if saved
         """
@@ -596,7 +598,25 @@ class Visualization:
         
         ax1.set_xlabel('Pixel X')
         ax1.set_ylabel('Pixel Y')
-        
+
+        # Add anchor pixel markers if calibration result is available
+        if calibration_result is not None:
+            cold_x = getattr(calibration_result, 'cold_pixel_x', None)
+            cold_y = getattr(calibration_result, 'cold_pixel_y', None)
+            hot_x = getattr(calibration_result, 'hot_pixel_x', None)
+            hot_y = getattr(calibration_result, 'hot_pixel_y', None)
+
+            if cold_x is not None and cold_y is not None:
+                ax1.scatter(cold_x, cold_y, c='blue', marker='o', s=50, edgecolors='white',
+                           linewidth=1.5, alpha=0.9, label='Cold Pixel')
+
+            if hot_x is not None and hot_y is not None:
+                ax1.scatter(hot_x, hot_y, c='red', marker='o', s=50, edgecolors='white',
+                           linewidth=1.5, alpha=0.9, label='Hot Pixel')
+
+            # Add legend in upper left to avoid overlap with image features
+            ax1.legend(loc='upper left', fontsize=8, framealpha=0.8, bbox_to_anchor=(0.02, 0.98))
+
         # Panel 2: ETa Map
         ax2 = axes[0, 1]
         if 'ET_daily' in cube.data:

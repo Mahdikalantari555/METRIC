@@ -41,7 +41,7 @@ class LatentHeatFluxConfig:
     min_ef: float = 0.0
     
     # Maximum EF (evaporative fraction) - safety ceiling
-    max_ef: float = 1.2
+    max_ef: float = 0.95
     
     # Allow negative LE (advection conditions)
     allow_negative_le: bool = False

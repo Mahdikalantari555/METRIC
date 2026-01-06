@@ -433,3 +433,309 @@ class EnergyBalanceValidator:
             f"LE_cold_range=[{self.le_cold_min:.0%}, {self.le_cold_max:.0%}], "
             f"H_hot_range=[{self.h_hot_min:.0%}, {self.h_hot_max:.0%}])"
         )
+
+
+@dataclass
+class GlobalPostCalibrationValidation:
+    """Result container for global post-calibration validation."""
+    valid: bool  # Whether all constraints are satisfied
+    ef_min: float  # Minimum EF value
+    ef_p95: float  # 95th percentile of EF values
+    ef_mean: float  # Mean EF value
+    h_negative_fraction: float  # Fraction of H < 0 pixels
+    h_extreme_negative_fraction: float  # Fraction of H < -20 W/m² pixels
+    etrf_p95: float  # 95th percentile of ETrF values
+    etrf_mean: float  # Mean ETrF value
+    violations: List[str]  # List of constraint violations
+    warnings: List[str]  # List of warnings
+
+
+class GlobalPostCalibrationValidator:
+    """
+    Perform global post-calibration validation for METRIC model.
+    
+    This validator checks global constraints on calibrated scene data to ensure
+    physically realistic energy balance and evapotranspiration estimates.
+    
+    Constraints validated:
+    1. EF distribution sanity:
+       - EF_min ≥ 0.15
+       - EF_p95 ≤ 0.95
+       - mean(EF) ≤ 0.85
+    2. Sensible heat realism:
+       - fraction(H < 0) ≤ 0.01
+       - fraction(H < −20 W/m²) == 0
+    3. Evapotranspiration ratio (ETrF):
+       - P95(ETrF) ≤ 1.15
+       - mean(ETrF) ≤ 1.05
+    
+    If any constraint is violated, the calibration should be rejected.
+    """
+    
+    # Global post-calibration validation thresholds
+    EF_MIN_THRESHOLD = 0.15
+    EF_P95_THRESHOLD = 0.95
+    EF_MEAN_THRESHOLD = 0.85
+    
+    H_NEGATIVE_FRACTION_THRESHOLD = 0.01
+    H_EXTREME_NEGATIVE_THRESHOLD = 0.0  # Must be exactly 0
+    
+    ETRF_P95_THRESHOLD = 1.15
+    ETRF_MEAN_THRESHOLD = 1.05
+    
+    def __init__(
+        self,
+        ef_min_threshold: float = EF_MIN_THRESHOLD,
+        ef_p95_threshold: float = EF_P95_THRESHOLD,
+        ef_mean_threshold: float = EF_MEAN_THRESHOLD,
+        h_negative_fraction_threshold: float = H_NEGATIVE_FRACTION_THRESHOLD,
+        h_extreme_negative_threshold: float = H_EXTREME_NEGATIVE_THRESHOLD,
+        etrf_p95_threshold: float = ETRF_P95_THRESHOLD,
+        etrf_mean_threshold: float = ETRF_MEAN_THRESHOLD
+    ):
+        """
+        Initialize the GlobalPostCalibrationValidator.
+        
+        Args:
+            ef_min_threshold: Minimum acceptable EF value
+            ef_p95_threshold: Maximum acceptable 95th percentile EF value
+            ef_mean_threshold: Maximum acceptable mean EF value
+            h_negative_fraction_threshold: Maximum acceptable fraction of H < 0 pixels
+            h_extreme_negative_threshold: Required fraction of H < -20 W/m² pixels (must be 0)
+            etrf_p95_threshold: Maximum acceptable 95th percentile ETrF value
+            etrf_mean_threshold: Maximum acceptable mean ETrF value
+        """
+        self.ef_min_threshold = ef_min_threshold
+        self.ef_p95_threshold = ef_p95_threshold
+        self.ef_mean_threshold = ef_mean_threshold
+        self.h_negative_fraction_threshold = h_negative_fraction_threshold
+        self.h_extreme_negative_threshold = h_extreme_negative_threshold
+        self.etrf_p95_threshold = etrf_p95_threshold
+        self.etrf_mean_threshold = etrf_mean_threshold
+    
+    def validate_global_calibration(
+        self,
+        ef: xr.DataArray,
+        h: xr.DataArray,
+        etrf: xr.DataArray,
+        exclude_no_data: bool = True
+    ) -> GlobalPostCalibrationValidation:
+        """
+        Perform global post-calibration validation on calibrated scene data.
+        
+        This method validates that the calibrated scene data meets physical
+        realism constraints. If any constraint is violated, the validation fails.
+        
+        Args:
+            ef: Evaporative fraction array (dimensionless)
+            h: Sensible heat flux array (W/m²)
+            etrf: Reference evapotranspiration fraction array (dimensionless)
+            exclude_no_data: Whether to exclude NaN/invalid pixels from analysis
+            
+        Returns:
+            GlobalPostCalibrationValidation with validation results and statistics
+            
+        Raises:
+            ValueError: If required arrays are None or invalid
+        """
+        logger = logging.getLogger(__name__)
+        
+        # Validate inputs
+        if ef is None:
+            raise ValueError("EF array is required for global validation")
+        if h is None:
+            raise ValueError("H array is required for global validation")
+        if etrf is None:
+            raise ValueError("ETrF array is required for global validation")
+        
+        violations = []
+        warnings = []
+        
+        # Create valid pixel mask if excluding no data
+        if exclude_no_data:
+            valid_mask = (
+                ~np.isnan(ef.values) & 
+                ~np.isnan(h.values) & 
+                ~np.isnan(etrf.values) &
+                (ef.values >= 0) & 
+                (ef.values <= 1.0) &
+                (etrf.values >= 0) &
+                (etrf.values <= 2.0)  # ETrF should not exceed 2.0 in normal conditions
+            )
+        else:
+            valid_mask = np.ones_like(ef.values, dtype=bool)
+        
+        # Extract valid values
+        ef_valid = ef.values[valid_mask]
+        h_valid = h.values[valid_mask]
+        etrf_valid = etrf.values[valid_mask]
+        
+        if len(ef_valid) == 0:
+            raise ValueError("No valid pixels found for global validation")
+        
+        logger.info(f"Global validation: {len(ef_valid)} valid pixels out of {ef.size}")
+        
+        # 1. EF distribution validation
+        ef_min = float(np.nanmin(ef_valid))
+        ef_p95 = float(np.nanpercentile(ef_valid, 95))
+        ef_mean = float(np.nanmean(ef_valid))
+        
+        logger.debug(f"EF statistics: min={ef_min:.3f}, p95={ef_p95:.3f}, mean={ef_mean:.3f}")
+        
+        # Check EF minimum constraint
+        if ef_min < self.ef_min_threshold:
+            violations.append(
+                f"EF minimum {ef_min:.3f} < {self.ef_min_threshold:.3f} threshold"
+            )
+        
+        # Check EF 95th percentile constraint
+        if ef_p95 > self.ef_p95_threshold:
+            violations.append(
+                f"EF 95th percentile {ef_p95:.3f} > {self.ef_p95_threshold:.3f} threshold"
+            )
+        
+        # Check EF mean constraint
+        if ef_mean > self.ef_mean_threshold:
+            violations.append(
+                f"EF mean {ef_mean:.3f} > {self.ef_mean_threshold:.3f} threshold"
+            )
+        
+        # 2. Sensible heat flux validation
+        h_negative_count = np.sum(h_valid < 0)
+        h_negative_fraction = h_negative_count / len(h_valid)
+        
+        h_extreme_negative_count = np.sum(h_valid < -20.0)
+        h_extreme_negative_fraction = h_extreme_negative_count / len(h_valid)
+        
+        logger.debug(
+            f"H statistics: {h_negative_count} negative pixels ({h_negative_fraction:.1%}), "
+            f"{h_extreme_negative_count} extreme negative pixels ({h_extreme_negative_fraction:.1%})"
+        )
+        
+        # Check H negative fraction constraint
+        if h_negative_fraction > self.h_negative_fraction_threshold:
+            violations.append(
+                f"H negative fraction {h_negative_fraction:.1%} > {self.h_negative_fraction_threshold:.1%} threshold"
+            )
+        
+        # Check H extreme negative constraint (must be exactly 0)
+        if h_extreme_negative_fraction > self.h_extreme_negative_threshold:
+            violations.append(
+                f"H extreme negative fraction {h_extreme_negative_fraction:.1%} > {self.h_extreme_negative_threshold:.1%} threshold (must be 0)"
+            )
+        
+        # 3. ETrF validation
+        etrf_p95 = float(np.nanpercentile(etrf_valid, 95))
+        etrf_mean = float(np.nanmean(etrf_valid))
+        
+        logger.debug(f"ETrF statistics: p95={etrf_p95:.3f}, mean={etrf_mean:.3f}")
+        
+        # Check ETrF 95th percentile constraint
+        if etrf_p95 > self.etrf_p95_threshold:
+            violations.append(
+                f"ETrF 95th percentile {etrf_p95:.3f} > {self.etrf_p95_threshold:.3f} threshold"
+            )
+        
+        # Check ETrF mean constraint
+        if etrf_mean > self.etrf_mean_threshold:
+            violations.append(
+                f"ETrF mean {etrf_mean:.3f} > {self.etrf_mean_threshold:.3f} threshold"
+            )
+        
+        # Determine overall validity
+        valid = len(violations) == 0
+        
+        # Log validation results
+        if valid:
+            logger.info("Global post-calibration validation: PASSED")
+        else:
+            logger.error("Global post-calibration validation: FAILED")
+            for violation in violations:
+                logger.error(f"  VIOLATION: {violation}")
+        
+        # Add warnings for concerning but not failing values
+        if ef_p95 > 0.90 and ef_p95 <= self.ef_p95_threshold:
+            warnings.append(f"EF 95th percentile {ef_p95:.3f} is high but within threshold")
+        
+        if etrf_p95 > 1.10 and etrf_p95 <= self.etrf_p95_threshold:
+            warnings.append(f"ETrF 95th percentile {etrf_p95:.3f} is high but within threshold")
+        
+        if len(warnings) > 0:
+            for warning in warnings:
+                logger.warning(f"  WARNING: {warning}")
+        
+        return GlobalPostCalibrationValidation(
+            valid=valid,
+            ef_min=ef_min,
+            ef_p95=ef_p95,
+            ef_mean=ef_mean,
+            h_negative_fraction=h_negative_fraction,
+            h_extreme_negative_fraction=h_extreme_negative_fraction,
+            etrf_p95=etrf_p95,
+            etrf_mean=etrf_mean,
+            violations=violations,
+            warnings=warnings
+        )
+    
+    def validate_or_raise(
+        self,
+        ef: xr.DataArray,
+        h: xr.DataArray,
+        etrf: xr.DataArray,
+        exclude_no_data: bool = True
+    ) -> GlobalPostCalibrationValidation:
+        """
+        Perform global validation and raise exception if constraints are violated.
+        
+        Args:
+            ef: Evaporative fraction array (dimensionless)
+            h: Sensible heat flux array (W/m²)
+            etrf: Reference evapotranspiration fraction array (dimensionless)
+            exclude_no_data: Whether to exclude NaN/invalid pixels from analysis
+            
+        Returns:
+            GlobalPostCalibrationValidation if validation passes
+            
+        Raises:
+            ValueError: If any validation constraint is violated
+        """
+        result = self.validate_global_calibration(ef, h, etrf, exclude_no_data)
+        
+        if not result.valid:
+            violation_msg = "; ".join(result.violations)
+            raise ValueError(
+                f"Global post-calibration validation failed: {violation_msg}"
+            )
+        
+        return result
+    
+    def to_dict(self, result: GlobalPostCalibrationValidation) -> Dict[str, Any]:
+        """
+        Convert validation result to dictionary.
+        
+        Args:
+            result: GlobalPostCalibrationValidation from validate_global_calibration()
+            
+        Returns:
+            Dictionary representation of validation results
+        """
+        return {
+            "valid": result.valid,
+            "ef_min": float(result.ef_min),
+            "ef_p95": float(result.ef_p95),
+            "ef_mean": float(result.ef_mean),
+            "h_negative_fraction": float(result.h_negative_fraction),
+            "h_extreme_negative_fraction": float(result.h_extreme_negative_fraction),
+            "etrf_p95": float(result.etrf_p95),
+            "etrf_mean": float(result.etrf_mean),
+            "violations": result.violations,
+            "warnings": result.warnings
+        }
+    
+    def __repr__(self) -> str:
+        return (
+            f"GlobalPostCalibrationValidator("
+            f"EF_thresholds=[min≥{self.ef_min_threshold:.2f}, p95≤{self.ef_p95_threshold:.2f}, mean≤{self.ef_mean_threshold:.2f}], "
+            f"H_constraints=[neg_frac≤{self.h_negative_fraction_threshold:.0%}, extreme_neg={self.h_extreme_negative_threshold:.0%}], "
+            f"ETrF_thresholds=[p95≤{self.etrf_p95_threshold:.2f}, mean≤{self.etrf_mean_threshold:.2f}])"
+        )
