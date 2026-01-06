@@ -143,6 +143,10 @@ class LandsatReader:
         cube.metadata['cloud_cover'] = mtl_data.get('cloud_cover', 0.0)
         cube.metadata['path'] = mtl_data.get('path')
         cube.metadata['row'] = mtl_data.get('row')
+        # Extract scene_id from Landsat product ID
+        scene_id = mtl_data.get('LANDSAT_PRODUCT_ID')
+        if scene_id:
+            cube.metadata['scene_id'] = scene_id
         
         # Set acquisition time
         if 'datetime' in mtl_data:

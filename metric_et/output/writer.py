@@ -278,6 +278,15 @@ def write_metadata(
             'Ts_cold': float(calibration.ts_cold) if isinstance(calibration.ts_cold, (int, float, np.integer, np.floating)) else float(np.nanmean(calibration.ts_cold)) if hasattr(calibration.ts_cold, 'values') else float(calibration.ts_cold),
             'Ts_hot': float(calibration.ts_hot) if isinstance(calibration.ts_hot, (int, float, np.integer, np.floating)) else float(np.nanmean(calibration.ts_hot)) if hasattr(calibration.ts_hot, 'values') else float(calibration.ts_hot),
             'Ta': float(calibration.air_temperature) if isinstance(calibration.air_temperature, (int, float, np.integer, np.floating)) else float(np.nanmean(calibration.air_temperature)) if hasattr(calibration.air_temperature, 'values') else float(calibration.air_temperature),
+            # Anchor pixel surface properties and coordinates
+            'cold_pixel_ndvi': float(getattr(calibration, 'cold_pixel_ndvi', np.nan)),
+            'cold_pixel_albedo': float(getattr(calibration, 'cold_pixel_albedo', np.nan)),
+            'hot_pixel_ndvi': float(getattr(calibration, 'hot_pixel_ndvi', np.nan)),
+            'hot_pixel_albedo': float(getattr(calibration, 'hot_pixel_albedo', np.nan)),
+            'cold_pixel_x': float(getattr(calibration, 'cold_pixel_x', np.nan)),
+            'cold_pixel_y': float(getattr(calibration, 'cold_pixel_y', np.nan)),
+            'hot_pixel_x': float(getattr(calibration, 'hot_pixel_x', np.nan)),
+            'hot_pixel_y': float(getattr(calibration, 'hot_pixel_y', np.nan)),
             'valid': calibration.valid,
             'errors': calibration.errors
         },
