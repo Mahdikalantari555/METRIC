@@ -232,6 +232,7 @@ NDVI_THRESHOLDS = {
 # DEFAULT OUTPUT VARIABLES
 # ============================================================================
 
+# Output variable configurations
 OUTPUT_VARIABLES = {
     "required": [
         "et_instantaneous",
@@ -251,4 +252,136 @@ OUTPUT_VARIABLES = {
         "aerodynamic_resistance",
         "bulk_aerodynamic_resistance"
     ]
+}
+
+# ============================================================================
+# CONFIGURABLE OUTPUT PRODUCTS
+# ============================================================================
+# These define the output products that can be written by the OutputWriter.
+# Each product is a tuple: (output_name, band_name_in_cube, dtype)
+# - output_name: Name used in the output filename
+# - band_name_in_cube: Key name of the band in the DataCube
+# - dtype: Output data type (float32, uint8, etc.)
+
+OUTPUT_PRODUCTS = {
+    # Required ET products (always included by default)
+    "required": [
+        ("ETa_daily", "ET_daily", "float32"),
+        ("ET_inst", "ET_inst", "float32"),
+        ("ETrF", "ETrF", "float32"),
+        ("LE", "LE", "float32"),
+        ("quality", "quality_mask", "uint8")
+    ],
+    # Optional energy balance products
+    "energy_balance": [
+        ("Rn", "R_n", "float32"),
+        ("G", "G", "float32"),
+        ("H", "H", "float32")
+    ],
+    # Quality layer products
+    "quality": [
+        ("ET_quality_class", "ET_quality_class", "uint8"),
+        ("ETa_classified", "ETa_class", "uint8"),
+        ("CWSI", "CWSI", "float32")
+    ],
+    # Surface property products
+    "surface": [
+        ("NDVI", "ndvi", "float32"),
+        ("Albedo", "albedo", "float32"),
+        ("LST", "lst", "float32"),
+        ("LAI", "lai", "float32"),
+        ("Emissivity", "emissivity", "float32"),
+        ("FVC", "fvc", "float32"),
+        ("SAVI", "savi", "float32")
+    ],
+    # Radiation products
+    "radiation": [
+        ("Rns", "R_ns", "float32"),
+        ("Rnl", "R_nl", "float32"),
+        ("Rs_down", "Rs_down", "float32"),
+        ("Rl_down", "R_l_down", "float32"),
+        ("Rl_up", "R_l_up", "float32")
+    ]
+}
+
+# Helper function to create custom output product list
+def get_output_products(
+    include_required: bool = True,
+    include_energy: bool = True,
+    include_quality: bool = True,
+    include_surface: bool = False,
+    include_radiation: bool = False,
+    custom_products: list = None
+) -> list:
+    """Generate a custom output product list based on inclusion flags.
+    
+    Args:
+        include_required: Include required ET products
+        include_energy: Include energy balance products (Rn, G, H)
+        include_quality: Include quality layer products
+        include_surface: Include surface property products
+        include_radiation: Include radiation products
+        custom_products: Additional custom products to include
+    
+    Returns:
+        List of product tuples (output_name, band_name, dtype)
+    """
+    products = []
+    
+    if include_required:
+        products.extend(OUTPUT_PRODUCTS['required'])
+    if include_energy:
+        products.extend(OUTPUT_PRODUCTS['energy_balance'])
+    if include_quality:
+        products.extend(OUTPUT_PRODUCTS['quality'])
+    if include_surface:
+        products.extend(OUTPUT_PRODUCTS['surface'])
+    if include_radiation:
+        products.extend(OUTPUT_PRODUCTS['radiation'])
+    
+    if custom_products:
+        products.extend(custom_products)
+    
+    return products
+
+
+# Predefined output product presets
+OUTPUT_PRESETS = {
+    # Minimal: Only essential ET products
+    "minimal": [
+        ("ETa_daily", "ET_daily", "float32"),
+        ("ETrF", "ETrF", "float32")
+    ],
+    # Standard: ET products with energy balance
+    "standard": [
+        ("ETa_daily", "ET_daily", "float32"),
+        ("ET_inst", "ET_inst", "float32"),
+        ("ETrF", "ETrF", "float32"),
+        ("Rn", "R_n", "float32"),
+        ("G", "G", "float32"),
+        ("H", "H", "float32"),
+        ("LE", "LE", "float32")
+    ],
+    # Full: All available products
+    "full": None,  # None means all products
+    
+    # ET only: Instantaneous and daily ET
+    "et_only": [
+        ("ETa_daily", "ET_daily", "float32"),
+        ("ET_inst", "ET_inst", "float32"),
+        ("ETrF", "ETrF", "float32")
+    ],
+    
+    # With quality: ET products with quality layers
+    "with_quality": [
+        ("ETa_daily", "ET_daily", "float32"),
+        ("ET_inst", "ET_inst", "float32"),
+        ("ETrF", "ETrF", "float32"),
+        ("ET_quality_class", "ET_quality_class", "uint8"),
+        ("ETa_classified", "ETa_class", "uint8"),
+        ("CWSI", "CWSI", "float32")
+    ],
+    
+    # Research: All products including surface and radiation
+    "research": None  # All products
 }

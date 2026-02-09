@@ -405,13 +405,43 @@ class OutputWriter:
         output_dir: Base output directory for all files
         compression: Default compression for GeoTIFF files
         nodata: Default no-data value
+        output_products: List of products to write (None = all products)
     """
+    
+    # Default output product definitions
+    DEFAULT_PRODUCTS = {
+        'required': [
+            ('ETa_daily', 'ET_daily', 'float32'),
+            ('ET_inst', 'ET_inst', 'float32'),
+            ('ETrF', 'ETrF', 'float32'),
+            ('LE', 'LE', 'float32'),
+            ('quality', 'quality_mask', 'uint8')
+        ],
+        'optional': [
+            ('Rn', 'R_n', 'float32'),
+            ('G', 'G', 'float32'),
+            ('H', 'H', 'float32')
+        ],
+        'quality': [
+            ('ET_quality_class', 'ET_quality_class', 'uint8'),
+            ('ETa_classified', 'ETa_class', 'uint8'),
+            ('CWSI', 'CWSI', 'float32')
+        ],
+        'surface': [
+            ('NDVI', 'ndvi', 'float32'),
+            ('Albedo', 'albedo', 'float32'),
+            ('LST', 'lst', 'float32'),
+            ('LAI', 'lai', 'float32')
+        ]
+    }
     
     def __init__(
         self,
         output_dir: str = ".",
         compression: str = "LZW",
-        nodata: float = np.nan
+        nodata: float = np.nan,
+        output_products: Optional[list] = None,
+        include_surface_properties: bool = False
     ):
         """Initialize the OutputWriter.
         
@@ -419,11 +449,30 @@ class OutputWriter:
             output_dir: Base output directory for all files
             compression: Default compression for GeoTIFF files
             nodata: Default no-data value
+            output_products: List of products to write as tuples (output_name, band_name, dtype).
+                            Example: [('ETa_daily', 'ET_daily', 'float32'), ('ETrF', 'ETrF', 'float32')]
+                            If None, writes all default products.
+            include_surface_properties: Whether to include surface property outputs (NDVI, Albedo, LST, LAI)
         """
         self.output_dir = Path(output_dir)
         self.compression = compression
         self.nodata = nodata
         self.output_files = []
+        self._include_surface = include_surface_properties
+        
+        # Build output products list
+        if output_products is not None:
+            # Use custom product list
+            self._output_products = output_products
+        else:
+            # Use default products
+            self._output_products = (
+                self.DEFAULT_PRODUCTS['required'] +
+                self.DEFAULT_PRODUCTS['optional'] +
+                self.DEFAULT_PRODUCTS['quality']
+            )
+            if include_surface_properties:
+                self._output_products += self.DEFAULT_PRODUCTS['surface']
         
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -454,76 +503,29 @@ class OutputWriter:
         cube: DataCube,
         scene_id: str,
         date: str,
-        calibration: CalibrationResult
+        calibration: Optional[CalibrationResult] = None,
+        products: Optional[list] = None
     ) -> Dict[str, str]:
-        """Write all ET products to GeoTIFF files.
+        """Write ET products to GeoTIFF files with configurable output selection.
         
         Args:
             cube: DataCube containing ET products
             scene_id: Scene identifier
             date: Date string (YYYYMMDD)
-            calibration: CalibrationResult from dT calibration
-            
+            calibration: CalibrationResult from dT calibration (optional for custom products)
+            products: Override list of products to write. If None, uses instance defaults.
+                     Format: [(output_name, band_name, dtype), ...]
+                     Example: [('ETa_daily', 'ET_daily', 'float32'), ('ETrF', 'ETrF', 'float32')]
+        
         Returns:
             Dictionary mapping product names to file paths
         """
         output_files = {}
         
-        # Define product mappings
-        products = [
-            ('ETa_daily', 'ET_daily', 'float32'),
-            ('ET_inst', 'ET_inst', 'float32'),
-            ('ETrF', 'ETrF', 'float32'),
-            ('LE', 'LE', 'float32'),
-            ('quality', 'quality_mask', 'uint8')
-        ]
+        # Use provided products or fall back to instance defaults
+        product_list = products if products is not None else self._output_products
         
-        # Optional energy balance products
-        optional_products = [
-            ('Rn', 'R_n', 'float32'),
-            ('G', 'G', 'float32'),
-            ('H', 'H', 'float32')
-        ]
-        
-        # Quality layer products
-        quality_products = [
-            ('ET_quality_class', 'ET_quality_class', 'uint8'),
-            ('ETa_classified', 'ETa_class', 'uint8'),
-            ('CWSI', 'CWSI', 'float32')
-        ]
-        
-        # Write required products
-        for product_name, band_name, dtype in products:
-            if band_name in cube.data:
-                filepath = self._make_filename(product_name, scene_id, date, 'tif')
-                write_geotiff(
-                    str(filepath),
-                    cube.data[band_name],
-                    cube,
-                    compression=self.compression,
-                    nodata=self.nodata,
-                    dtype=dtype
-                )
-                output_files[product_name] = str(filepath)
-                self.output_files.append(filepath)
-        
-        # Write optional products if available
-        for product_name, band_name, dtype in optional_products:
-            if band_name in cube.data:
-                filepath = self._make_filename(product_name, scene_id, date, 'tif')
-                write_geotiff(
-                    str(filepath),
-                    cube.data[band_name],
-                    cube,
-                    compression=self.compression,
-                    nodata=self.nodata,
-                    dtype=dtype
-                )
-                output_files[product_name] = str(filepath)
-                self.output_files.append(filepath)
-        
-        # Write quality layer products if available
-        for product_name, band_name, dtype in quality_products:
+        for product_name, band_name, dtype in product_list:
             if band_name in cube.data:
                 filepath = self._make_filename(product_name, scene_id, date, 'tif')
                 write_geotiff(
@@ -538,6 +540,26 @@ class OutputWriter:
                 self.output_files.append(filepath)
         
         return output_files
+    
+    def write_custom_products(
+        self,
+        cube: DataCube,
+        scene_id: str,
+        date: str,
+        products: list
+    ) -> Dict[str, str]:
+        """Write custom products to GeoTIFF files.
+        
+        Args:
+            cube: DataCube containing the data
+            scene_id: Scene identifier
+            date: Date string (YYYYMMDD)
+            products: List of products as tuples (output_name, band_name, dtype)
+        
+        Returns:
+            Dictionary mapping product names to file paths
+        """
+        return self.write_et_products(cube, scene_id, date, products=products)
     
     write_et_products_csv = write_statistics_csv
     

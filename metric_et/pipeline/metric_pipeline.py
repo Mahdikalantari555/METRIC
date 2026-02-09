@@ -1243,8 +1243,16 @@ class METRICPipeline:
             "valid": self._calibration_result.valid
         }
 
-    def save_results(self, output_dir: str) -> None:
-        """Save results to output directory."""
+    def save_results(self, output_dir: str, output_products: Optional[list] = None) -> None:
+        """Save results to output directory with configurable output products.
+        
+        Args:
+            output_dir: Directory to save output files
+            output_products: Optional list of products to write. Format:
+                           [(output_name, band_name, dtype), ...]
+                           Example: [('ETa_daily', 'ET_daily', 'float32'), ('ETrF', 'ETrF', 'float32')]
+                           If None, uses config['output_products'] or default products.
+        """
         from ..output import OutputWriter, Visualization
         import os
         import logging
@@ -1261,8 +1269,19 @@ class METRICPipeline:
 
             logger.info(f"Saving results to {output_dir}")
 
+            # Get output configuration from config or use provided
+            config_output_products = self.config.get('output_products')
+            products_to_use = output_products or config_output_products
+            
+            # Determine if surface properties should be included
+            include_surface = self.config.get('include_surface_properties', False)
+            
             # Use OutputWriter to save products
-            writer = OutputWriter(output_dir=output_dir)
+            writer = OutputWriter(
+                output_dir=output_dir,
+                output_products=products_to_use,
+                include_surface_properties=include_surface
+            )
             
             # Get scene information for naming
             scene_id = self.data.metadata.get('scene_id', 'METRIC')
@@ -1293,9 +1312,10 @@ class METRICPipeline:
                     rn_hot=np.nan, g_hot=np.nan, h_hot=np.nan, le_hot=np.nan
                 )
             
-            # Write ET products
+            # Write ET products with configurable output selection
             output_files = writer.write_et_products(
-                self.data, scene_id, date_str, actual_calibration
+                self.data, scene_id, date_str, actual_calibration,
+                products=products_to_use
             )
             
             logger.info(f"ET products saved: {list(output_files.keys())}")
