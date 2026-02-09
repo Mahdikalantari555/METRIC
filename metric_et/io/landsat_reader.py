@@ -48,10 +48,15 @@ class LandsatReader:
         >>> reader = LandsatReader()
         >>> cube = reader.load("data/landsat_20251204_166_038/")
         >>> print(cube)
+        
+    Example with custom band mapping:
+        >>> custom_mapping = {'blue': 'B02.tif', 'green': 'B03.tif', ...}
+        >>> reader = LandsatReader(band_mapping=custom_mapping)
+        >>> cube = reader.load("data/custom_scene/")
     """
     
-    # Band name to filename mapping for Landsat 8/9 (OLI)
-    BAND_MAPPING = {
+    # Default band name to filename mapping for Landsat 8/9 (OLI)
+    DEFAULT_BAND_MAPPING = {
         'blue': 'blue.tif',
         'green': 'green.tif',
         'red': 'red.tif',
@@ -63,38 +68,39 @@ class LandsatReader:
         'qa_pixel': 'qa_pixel.tif',
     }
     
-    # Scale factors for band data conversion
-    # Landsat Collection 2 Level-2 products are already in physical units
-    # All bands use scale factor 1.0 (no additional scaling needed)
-    SCALE_FACTORS = {
-        'blue': 1.0,
-        'green': 1.0,
-        'red': 1.0,
-        'nir08': 1.0,
-        'swir16': 1.0,
-        'swir22': 1.0,
-        'lwir11': 1.0,  # Already in Kelvin
-        'qa': 1.0,
-        'qa_pixel': 1.0,
-    }
+    # Keep BAND_MAPPING as alias for backward compatibility
+    BAND_MAPPING = DEFAULT_BAND_MAPPING
     
-    # Add offsets for band data conversion
-    ADD_OFFSETS = {
-        'blue': 0.0,
-        'green': 0.0,
-        'red': 0.0,
-        'nir08': 0.0,
-        'swir16': 0.0,
-        'swir22': 0.0,
-        'lwir11': 0.0,
-        'qa': 0.0,
-        'qa_pixel': 0.0,
-    }
+    def __init__(self, band_mapping: Optional[Dict[str, str]] = None):
+        """Initialize the LandsatReader with optional custom band mapping.
+        
+        Args:
+            band_mapping: Optional custom mapping of band names to filenames.
+                          If None, uses default Landsat 8/9 band naming.
+                          Example: {'blue': 'B02_30m.tif', 'green': 'B03_30m.tif', ...}
+        """
+        self.band_mapping = band_mapping if band_mapping is not None else self.DEFAULT_BAND_MAPPING.copy()
+        # Keep scale_factors and add_offsets synchronized with band_mapping
+        self._sync_scale_factors()
     
-    
-    def __init__(self):
-        """Initialize the LandsatReader."""
-        pass
+    def _sync_scale_factors(self):
+        """Synchronize scale factors and offsets with current band_mapping."""
+        # Default scale factors for standard Landsat bands
+        default_scales = {
+            'blue': 1.0, 'green': 1.0, 'red': 1.0, 'nir08': 1.0,
+            'swir16': 1.0, 'swir22': 1.0, 'lwir11': 1.0, 'qa': 1.0, 'qa_pixel': 1.0
+        }
+        default_offsets = {
+            'blue': 0.0, 'green': 0.0, 'red': 0.0, 'nir08': 0.0,
+            'swir16': 0.0, 'swir22': 0.0, 'lwir11': 0.0, 'qa': 0.0, 'qa_pixel': 0.0
+        }
+        
+        # Build instance-specific scale factors and offsets
+        self.SCALE_FACTORS = {}
+        self.ADD_OFFSETS = {}
+        for band_name in self.band_mapping.keys():
+            self.SCALE_FACTORS[band_name] = default_scales.get(band_name, 1.0)
+            self.ADD_OFFSETS[band_name] = default_offsets.get(band_name, 0.0)
     
     def load(self, scene_path: str) -> DataCube:
         """
@@ -127,8 +133,8 @@ class LandsatReader:
         
         mtl_data = self._read_mtl(mtl_path)
         
-        # Read each band
-        for band_name, filename in self.BAND_MAPPING.items():
+        # Read each band using instance's band_mapping (supports custom mapping)
+        for band_name, filename in self.band_mapping.items():
             band_path = scene_path / filename
             if not band_path.exists():
                 raise BandNotFoundError(f"Band file not found: {band_path}")
@@ -161,8 +167,9 @@ class LandsatReader:
                 except ValueError:
                     cube.acquisition_time = None
         
-        # Set CRS and transform from first band
-        first_band_path = scene_path / next(iter(self.BAND_MAPPING.values()))
+        # Set CRS and transform from first band in the mapping
+        first_band_filename = next(iter(self.band_mapping.values()))
+        first_band_path = scene_path / first_band_filename
         with rasterio.open(first_band_path) as src:
             cube.crs = src.crs
             cube.transform = src.transform
@@ -301,10 +308,10 @@ class LandsatReader:
         Raises:
             BandNotFoundError: If band mapping doesn't exist
         """
-        if band_name not in self.BAND_MAPPING:
+        if band_name not in self.band_mapping:
             raise BandNotFoundError(f"Unknown band: {band_name}")
         
-        return Path(scene_path) / self.BAND_MAPPING[band_name]
+        return Path(scene_path) / self.band_mapping[band_name]
     
     def validate_scene(self, scene_path: str) -> Tuple[bool, list]:
         """
@@ -319,7 +326,7 @@ class LandsatReader:
         scene_path = Path(scene_path)
         missing_bands = []
         
-        for band_name, filename in self.BAND_MAPPING.items():
+        for band_name, filename in self.band_mapping.items():
             band_path = scene_path / filename
             if not band_path.exists():
                 missing_bands.append(band_name)
@@ -327,15 +334,16 @@ class LandsatReader:
         return len(missing_bands) == 0, missing_bands
 
 
-def read_landsat_scene(scene_path: str) -> DataCube:
+def read_landsat_scene(scene_path: str, band_mapping: Optional[Dict[str, str]] = None) -> DataCube:
     """
     Convenience function to load a Landsat scene.
     
     Args:
         scene_path: Path to the Landsat scene directory
+        band_mapping: Optional custom mapping of band names to filenames
         
     Returns:
         DataCube containing all bands and metadata
     """
-    reader = LandsatReader()
+    reader = LandsatReader(band_mapping=band_mapping)
     return reader.load(scene_path)
