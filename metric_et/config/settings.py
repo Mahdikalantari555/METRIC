@@ -81,17 +81,16 @@ THERMAL_NATIVE_RESOLUTION = 100  # 100m for Landsat 8/9 TIRS
 DEM_RESOLUTION = 30  # Match Landsat resolution
 
 # ============================================================================
-# PHYSICAL CONSTANTS (from constants.py)
+# PHYSICAL CONSTANTS (from core/constants.py)
 # ============================================================================
 
-from .constants import (
+from ..core.constants import (
     STEFAN_BOLTZMANN,
     VON_KARMAN,
     AIR_DENSITY,
     AIR_SPECIFIC_HEAT,
     LATENT_HEAT_VAPORIZATION,
     SOLAR_CONSTANT,
-    STEFAN_BOLTZMANN,
     GRAVITATIONAL_ACCELERATION
 )
 

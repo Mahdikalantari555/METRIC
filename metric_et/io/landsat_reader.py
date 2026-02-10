@@ -137,6 +137,9 @@ class LandsatReader:
         for band_name, filename in self.band_mapping.items():
             band_path = scene_path / filename
             if not band_path.exists():
+                # Skip optional QA bands if not found
+                if band_name in ['qa', 'qa_pixel']:
+                    continue
                 raise BandNotFoundError(f"Band file not found: {band_path}")
             
             data = self._read_band(band_path)
@@ -149,10 +152,41 @@ class LandsatReader:
         cube.metadata['cloud_cover'] = mtl_data.get('cloud_cover', 0.0)
         cube.metadata['path'] = mtl_data.get('path')
         cube.metadata['row'] = mtl_data.get('row')
-        # Extract scene_id from Landsat product ID
-        scene_id = mtl_data.get('LANDSAT_PRODUCT_ID')
-        if scene_id:
-            cube.metadata['scene_id'] = scene_id
+        
+        # Extract platform from MTL (e.g., 'landsat-8', 'landsat-9')
+        cube.metadata['platform'] = mtl_data.get('platform', 'unknown')
+        
+        # Extract sensor from instruments (combine multiple instruments with '_')
+        instruments = mtl_data.get('instruments', [])
+        if instruments:
+            if isinstance(instruments, list):
+                cube.metadata['sensor'] = '_'.join(instruments).lower()
+            else:
+                cube.metadata['sensor'] = str(instruments).lower()
+        else:
+            # Fallback: derive from scene_id (e.g., 'LC08' -> 'oli')
+            scene_id = mtl_data.get('LANDSAT_PRODUCT_ID', '')
+            if scene_id.startswith('LC08') or scene_id.startswith('LO08'):
+                cube.metadata['sensor'] = 'oli'
+            elif scene_id.startswith('LC09') or scene_id.startswith('LO09'):
+                cube.metadata['sensor'] = 'oli_tirs'
+            elif scene_id.startswith('LC07'):
+                cube.metadata['sensor'] = 'etm'
+            elif scene_id.startswith('LC05'):
+                cube.metadata['sensor'] = 'tm'
+            else:
+                cube.metadata['sensor'] = 'unknown'
+        
+        # Extract processing level/correction from landsat:correction (e.g., 'L2SP')
+        cube.metadata['correction'] = mtl_data.get('landsat_correction', mtl_data.get('correction', 'L2'))
+        
+        # Extract scene_id - always set from LANDSAT_PRODUCT_ID or item_id as fallback
+        scene_id = mtl_data.get('LANDSAT_PRODUCT_ID') or mtl_data.get('item_id', 'unknown')
+        cube.metadata['scene_id'] = scene_id
+        
+        # Also store item_id separately if available
+        if mtl_data.get('item_id'):
+            cube.metadata['item_id'] = mtl_data.get('item_id')
         
         # Set acquisition time
         if 'datetime' in mtl_data:
@@ -190,10 +224,68 @@ class LandsatReader:
         Raises:
             MTLParseError: If JSON parsing fails
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        
         try:
             with open(mtl_path, 'r') as f:
                 mtl_data = json.load(f)
-            return mtl_data
+            
+            logger.debug(f"MTL.json loaded from {mtl_path}")
+            
+            # Extract key fields to top level for easier access
+            # This handles the nested STAC-like structure
+            extracted = {
+                'item_id': mtl_data.get('item_id'),
+                'datetime': mtl_data.get('datetime'),
+                'cloud_cover': mtl_data.get('cloud_cover', 0.0),
+                'path': mtl_data.get('path'),
+                'row': mtl_data.get('row'),
+                'sun_elevation': mtl_data.get('sun_elevation'),
+                'sun_azimuth': mtl_data.get('sun_azimuth'),
+                'platform': mtl_data.get('platform'),
+                'instruments': mtl_data.get('instruments'),
+                'scene_id': mtl_data.get('landsat:scene_id') or mtl_data.get('item_id'),
+                'LANDSAT_PRODUCT_ID': mtl_data.get('item_id'),
+            }
+            
+            logger.debug(f"Initial extracted: item_id={extracted.get('item_id')}, scene_id={extracted.get('scene_id')}")
+            
+            # Extract from properties object if it exists
+            properties = mtl_data.get('properties', {})
+            if properties:
+                logger.debug(f"Properties found in MTL.json: {list(properties.keys())}")
+                if 'landsat:correction' in properties:
+                    extracted['landsat_correction'] = properties.get('landsat:correction')
+                if 'landsat:scene_id' in properties:
+                    extracted['scene_id'] = properties.get('landsat:scene_id')
+                if 'landsat:wrs_path' in properties:
+                    extracted['path'] = properties.get('landsat:wrs_path')
+                if 'landsat:wrs_row' in properties:
+                    extracted['row'] = properties.get('landsat:wrs_row')
+                if 'platform' in properties:
+                    extracted['platform'] = properties.get('platform')
+                if 'instruments' in properties:
+                    extracted['instruments'] = properties.get('instruments')
+            
+            # Extract from METADATA object if it exists
+            metadata = mtl_data.get('METADATA', {})
+            product_metadata = metadata.get('PRODUCT_METADATA', {})
+            if product_metadata:
+                logger.debug(f"PRODUCT_METADATA found: {list(product_metadata.keys())}")
+                if 'LANDSAT_PRODUCT_ID' in product_metadata:
+                    extracted['LANDSAT_PRODUCT_ID'] = product_metadata.get('LANDSAT_PRODUCT_ID')
+                if 'WRS Path' in product_metadata:
+                    extracted['path'] = product_metadata.get('WRS Path')
+                if 'WRS Row' in product_metadata:
+                    extracted['row'] = product_metadata.get('WRS Row')
+                if 'CLOUD_COVER' in product_metadata:
+                    extracted['cloud_cover'] = product_metadata.get('CLOUD_COVER')
+            
+            logger.debug(f"Final extracted: item_id={extracted.get('item_id')}, LANDSAT_PRODUCT_ID={extracted.get('LANDSAT_PRODUCT_ID')}, scene_id={extracted.get('scene_id')}, platform={extracted.get('platform')}, instruments={extracted.get('instruments')}")
+            
+            return extracted
+            
         except json.JSONDecodeError as e:
             raise MTLParseError(f"Failed to parse MTL.json: {e}")
         except IOError as e:
@@ -329,7 +421,9 @@ class LandsatReader:
         for band_name, filename in self.band_mapping.items():
             band_path = scene_path / filename
             if not band_path.exists():
-                missing_bands.append(band_name)
+                # Skip optional QA bands in validation
+                if band_name not in ['qa', 'qa_pixel']:
+                    missing_bands.append(band_name)
         
         return len(missing_bands) == 0, missing_bands
 

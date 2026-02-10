@@ -23,7 +23,6 @@ class METRICPipeline:
         self._eb_manager = None  # Store EnergyBalanceManager instance for reuse
         self._scene_quality = "GOOD"  # Track scene quality based on calibration decision
         self._scene_id = "unknown"  # Track current scene ID
-        self._qa_coverage_issue = False  # Track QA coverage issues for quality flagging
         self._original_extent = None     # Store original scene extent before clipping
         self._roi_extent = None          # Store ROI extent after clipping
         self._roi_mask = None            # Store boolean mask for ROI boundaries
@@ -77,12 +76,6 @@ class METRICPipeline:
                 )
                 # Continue to ET calculation instead of returning early
             
-            # Check for QA coverage issues and flag as LOW QUALITY if needed
-            if hasattr(self, '_qa_coverage_issue') and self._qa_coverage_issue:
-                if self._scene_quality == "GOOD":
-                    self._scene_quality = "LOW_QUALITY"
-                    logger.info(f"Scene {self._scene_id} flagged as LOW QUALITY due to QA coverage issues")
-
             # Step 6: Calculate final ET
             logger.info("Step 6: Calculating evapotranspiration")
             self.calculate_et()
@@ -117,7 +110,9 @@ class METRICPipeline:
 
             # Load Landsat data
             logger.info(f"Loading Landsat data from {landsat_dir}")
-            landsat_reader = LandsatReader()
+            # Check if custom band mapping is provided in config
+            band_mapping = self.config.get('band_mapping')
+            landsat_reader = LandsatReader(band_mapping=band_mapping) if band_mapping else LandsatReader()
             landsat_cube = landsat_reader.load(landsat_dir)
 
             # Load ROI geometry for later use in final clipping (not for initial data loading)
@@ -530,13 +525,12 @@ class METRICPipeline:
 
     def validate_scene(self) -> Tuple[bool, str]:
         """Perform scene-level pre-validation (HARD REJECT) checks.
-
+        
         Returns:
             Tuple of (rejected: bool, reason: str)
             If rejected is True, the scene should be rejected with the given reason.
         """
         import logging
-        from ..core.constants import MJ_M2_DAY_TO_W
 
         logger = logging.getLogger(__name__)
 
@@ -552,33 +546,25 @@ class METRICPipeline:
             # Get required data
             ndvi = self.data.get("ndvi")
             rn = self.data.get("R_n")
-            et0_daily_array = self.data.get("et0_fao_evapotranspiration")
-            rs_inst_array = self.data.get("shortwave_radiation")
-            rs_daily_array = self.data.get("shortwave_radiation_sum")
-
+            
+            # Check if essential data is available
             if ndvi is None:
                 return True, "NDVI data not available for validation"
             if rn is None:
                 return True, "Net radiation (R_n) not available for validation"
-            if et0_daily_array is None or rs_inst_array is None or rs_daily_array is None:
-                return True, "Weather data not available for ET0_inst calculation"
 
-            # 1. Cloud coverage check: use cloud coverage fraction instead of QA coverage
-            # This uses the cloud coverage calculated during preprocessing
+            # 1. Cloud coverage check: Reject if >70% cloud coverage
             if not hasattr(self, '_cloud_coverage'):
                 logger.warning("Cloud coverage not calculated during preprocessing, skipping cloud coverage check")
                 cloud_coverage = 0.0
             else:
                 cloud_coverage = self._cloud_coverage
 
-            # Get cloud coverage thresholds from config
-            # Reject if >70% cloud coverage (cloud_reject_threshold = 0.70)
-            # Flag as LOW QUALITY if >30% cloud coverage (cloud_low_quality_threshold = 0.30)
+            # Get cloud coverage threshold from config
             cloud_reject_threshold = self.config.get('cloud_reject_threshold', 0.70)
-            cloud_low_quality_threshold = self.config.get('cloud_low_quality_threshold', 0.30)
 
             logger.info(f"Cloud coverage: {cloud_coverage:.3f}")
-            logger.info(f"Thresholds - Reject: >{cloud_reject_threshold:.2f}, Low Quality: >{cloud_low_quality_threshold:.2f}")
+            logger.info(f"Reject threshold: >{cloud_reject_threshold:.2f}")
 
             if cloud_coverage > cloud_reject_threshold:
                 # Reject if more than 70% cloud coverage
@@ -586,66 +572,10 @@ class METRICPipeline:
                 reason = f"Cloud coverage too high: {cloud_coverage:.3f} > {cloud_reject_threshold:.2f}"
                 logger.error(reason)
                 return rejected, reason
-            elif cloud_coverage > cloud_low_quality_threshold:
-                # Flag as LOW QUALITY if more than 30% cloud coverage
-                logger.warning(f"Cloud coverage indicates moderate cloud cover: {cloud_coverage:.3f} > {cloud_low_quality_threshold:.2f} - flagging as LOW QUALITY")
-                # Store this information for later quality flagging
-                self._qa_coverage_issue = True
-                # Don't return here - continue with processing but will be flagged as LOW QUALITY later
-
-            # 2. NDVI dynamic range check: NDVI_p95 - NDVI_p05 < 0.30
-            ndvi_values = ndvi.values[~np.isnan(ndvi.values)]
-            if len(ndvi_values) == 0:
-                return True, "No valid NDVI values for dynamic range check"
-
-            ndvi_p5 = np.percentile(ndvi_values, 5)
-            ndvi_p95 = np.percentile(ndvi_values, 95)
-            ndvi_range = ndvi_p95 - ndvi_p5
-
-            logger.info(f"NDVI dynamic range: P95={ndvi_p95:.3f}, P5={ndvi_p5:.3f}, range={ndvi_range:.3f}")
-
-            if ndvi_range < 0.30:
-                rejected = True
-                reason = f"NDVI dynamic range too low: {ndvi_range:.3f} < 0.30"
-                logger.warning(reason)
-                return rejected, reason
-
-            # 3. Net radiation sanity check: median(Rn) < 300 W/m²
-            rn_values = rn.values[~np.isnan(rn.values)]
-            if len(rn_values) == 0:
-                return True, "No valid Rn values for median check"
-
-            rn_median = np.median(rn_values)
-
-            logger.info(f"Net radiation median: {rn_median:.1f} W/m²")
-
-            if rn_median < 300:
-                rejected = True
-                reason = f"Net radiation median too low: {rn_median:.1f} < 300 W/m²"
-                logger.warning(reason)
-                return rejected, reason
-
-            # 4. ET0_inst sanity check: ET0_inst < 0.2 or > 1.0 mm/hr
-            # Calculate ET0_inst similar to calibration
-            et0_daily = float(np.nanmean(et0_daily_array.values))
-            rs_inst = float(np.nanmean(rs_inst_array.values))
-            rs_daily = float(np.nanmean(rs_daily_array.values))
-
-            rs_daily_avg_w = rs_daily * MJ_M2_DAY_TO_W  # MJ/m²/day -> W/m²
-
-            if rs_daily_avg_w <= 0:
-                return True, "Invalid daily shortwave radiation for ET0_inst calculation"
-
-            radiation_ratio = rs_inst / rs_daily_avg_w
-            et0_inst = et0_daily * radiation_ratio  # mm/day-equivalent
-
-            logger.info(f"ET0_inst: {et0_inst:.3f} mm/day-equiv")
-
-            if et0_inst < 5.0 or et0_inst > 40.0:
-                rejected = True
-                reason = f"ET0_inst out of range: {et0_inst:.3f} mm/day-equiv (must be 5-40)"
-                logger.warning(reason)
-                return rejected, reason
+            
+            # Log if cloud coverage is moderate (between 30-70%) but continue processing
+            if cloud_coverage > 0.30:
+                logger.info(f"Cloud coverage is moderate: {cloud_coverage:.3f}. Processing will continue.")
 
             logger.info("Scene-level pre-validation passed")
             return False, ""
@@ -1048,9 +978,12 @@ class METRICPipeline:
             if "ET_inst" in inst_et_result:
                 et_inst_values = inst_et_result["ET_inst"]
                 valid_et_inst = et_inst_values[~np.isnan(et_inst_values)]
-                logger.info(f"ET_inst results: {len(valid_et_inst)} valid pixels")
-                logger.info(f"  Range: [{np.min(valid_et_inst):.6f}, {np.max(valid_et_inst):.6f}] mm/hr")
-                logger.info(f"  Mean: {np.mean(valid_et_inst):.6f} mm/hr, Std: {np.std(valid_et_inst):.6f} mm/hr")
+                if len(valid_et_inst) > 0:
+                    logger.info(f"ET_inst results: {len(valid_et_inst)} valid pixels")
+                    logger.info(f"  Range: [{np.min(valid_et_inst):.6f}, {np.max(valid_et_inst):.6f}] mm/hr")
+                    logger.info(f"  Mean: {np.mean(valid_et_inst):.6f} mm/hr, Std: {np.std(valid_et_inst):.6f} mm/hr")
+                else:
+                    logger.warning("ET_inst results: No valid pixels - all values are NaN")
 
             # Add instantaneous ET to data
             self.data.add("ET_inst", inst_et_result["ET_inst"])
@@ -1210,7 +1143,7 @@ class METRICPipeline:
                 results[key] = self.data.get(key)
 
         # ET results
-        et_keys = ['ET_inst', 'ET_daily', 'ETrF', 'ET_quality_class', 'ET_confidence']
+        et_keys = ['ET_inst', 'ET_daily', 'ETrF', 'ET_quality_class', 'ET_confidence', 'CWSI', 'ETa_class']
         for key in et_keys:
             if key in self.data.bands():
                 results[key] = self.data.get(key)
@@ -1276,11 +1209,20 @@ class METRICPipeline:
             # Determine if surface properties should be included
             include_surface = self.config.get('include_surface_properties', False)
             
+            # Get AOI name from config or ROI path
+            aoi_name = self.config.get('aoi_name', 'AOI')
+            if aoi_name == 'AOI':
+                # Try to extract AOI name from ROI path
+                roi_path = self.roi_path or "amirkabir.geojson"
+                if roi_path:
+                    aoi_name = os.path.splitext(os.path.basename(roi_path))[0]
+            
             # Use OutputWriter to save products
             writer = OutputWriter(
                 output_dir=output_dir,
                 output_products=products_to_use,
-                include_surface_properties=include_surface
+                include_surface_properties=include_surface,
+                aoi_name=aoi_name
             )
             
             # Get scene information for naming

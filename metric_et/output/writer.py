@@ -411,8 +411,8 @@ class OutputWriter:
     # Default output product definitions
     DEFAULT_PRODUCTS = {
         'required': [
-            ('ETa_daily', 'ET_daily', 'float32'),
-            ('ET_inst', 'ET_inst', 'float32'),
+            ('ETaDaily', 'ET_daily', 'float32'),
+            ('ETinst', 'ET_inst', 'float32'),
             ('ETrF', 'ETrF', 'float32'),
             ('LE', 'LE', 'float32'),
             ('quality', 'quality_mask', 'uint8')
@@ -420,18 +420,20 @@ class OutputWriter:
         'optional': [
             ('Rn', 'R_n', 'float32'),
             ('G', 'G', 'float32'),
-            ('H', 'H', 'float32')
+            ('H', 'H', 'float32'),
+            ('AirTemp', 'temperature_2m', 'float32')
         ],
         'quality': [
-            ('ET_quality_class', 'ET_quality_class', 'uint8'),
-            ('ETa_classified', 'ETa_class', 'uint8'),
+            ('ETqualityClass', 'ET_quality_class', 'uint8'),
+            ('ETaClassified', 'ETa_class', 'uint8'),
             ('CWSI', 'CWSI', 'float32')
         ],
         'surface': [
             ('NDVI', 'ndvi', 'float32'),
             ('Albedo', 'albedo', 'float32'),
             ('LST', 'lst', 'float32'),
-            ('LAI', 'lai', 'float32')
+            ('LAI', 'lai', 'float32'),
+            ('AirTemp', 'temperature_2m', 'float32')
         ]
     }
     
@@ -441,7 +443,8 @@ class OutputWriter:
         compression: str = "LZW",
         nodata: float = np.nan,
         output_products: Optional[list] = None,
-        include_surface_properties: bool = False
+        include_surface_properties: bool = False,
+        aoi_name: str = "AOI"
     ):
         """Initialize the OutputWriter.
         
@@ -453,12 +456,14 @@ class OutputWriter:
                             Example: [('ETa_daily', 'ET_daily', 'float32'), ('ETrF', 'ETrF', 'float32')]
                             If None, writes all default products.
             include_surface_properties: Whether to include surface property outputs (NDVI, Albedo, LST, LAI)
+            aoi_name: Area of Interest name for output filenames
         """
         self.output_dir = Path(output_dir)
         self.compression = compression
         self.nodata = nodata
         self.output_files = []
         self._include_surface = include_surface_properties
+        self._aoi_name = aoi_name
         
         # Build output products list
         if output_products is not None:
@@ -480,22 +485,60 @@ class OutputWriter:
     def _make_filename(
         self,
         product: str,
-        scene_id: str,
+        cube: DataCube,
         date: str,
         extension: str
     ) -> Path:
-        """Generate output filename following naming convention.
+        """Generate output filename following the convention:
+        {PRODUCT}_{PLATFORM}_{CORRECTION}_{RESOLUTION}_{SCENE_SHORT}_{DATE}_{AOI}.{extension}
+        
+        Example: CWSI_landsat8_L2SP_30_LC08_20200105_amirkabir.tif
         
         Args:
-            product: Product name (e.g., 'ETa_daily', 'ETrF')
-            scene_id: Scene identifier (e.g., 'LC08')
+            product: Product name (e.g., 'ETaDaily', 'ETrF')
+            cube: DataCube containing metadata
             date: Date string (YYYYMMDD)
             extension: File extension (e.g., 'tif', 'csv')
             
         Returns:
             Full output file path
         """
-        filename = f"{product}_{scene_id}_{date}.{extension}"
+        # Extract metadata from cube
+        metadata = cube.metadata
+        
+        # Platform (short form: landsat8, landsat9, etc.)
+        platform_raw = metadata.get('platform', 'unknown')
+        if 'landsat-8' in str(platform_raw).lower() or 'landsat8' in str(platform_raw).lower():
+            platform = 'landsat8'
+        elif 'landsat-9' in str(platform_raw).lower() or 'landsat9' in str(platform_raw).lower():
+            platform = 'landsat9'
+        elif 'landsat-7' in str(platform_raw).lower() or 'landsat7' in str(platform_raw).lower():
+            platform = 'landsat7'
+        elif 'landsat-5' in str(platform_raw).lower() or 'landsat5' in str(platform_raw).lower():
+            platform = 'landsat5'
+        else:
+            platform = str(platform_raw).lower().replace(' ', '_')
+        
+        # Correction level (e.g., L2SP, L1TP, L2SR) from landsat:correction
+        correction_raw = metadata.get('correction', 'L2')
+        correction = str(correction_raw).upper()
+        
+        # Resolution (default 30m for Landsat)
+        resolution = metadata.get('resolution', '30')
+        
+        # Scene ID - use short form (first 6 chars of product ID)
+        scene_id_raw = metadata.get('scene_id', 'unknown')
+        if '_' in scene_id_raw:
+            scene_id_short = scene_id_raw.split('_')[0]
+        else:
+            scene_id_short = scene_id_raw[:6] if len(scene_id_raw) >= 6 else scene_id_raw
+        
+        # AOI name
+        aoi = self._aoi_name
+        
+        # Build filename with format: PRODUCT_PLATFORM_LEVEL_RESOLUTION_SCENEID_DATE_AOI
+        filename = f"{product}_{platform}_{correction}_{resolution}_{scene_id_short}_{date}_{aoi}.{extension}"
+        
         return self.output_dir / filename
     
     def write_et_products(
@@ -527,7 +570,7 @@ class OutputWriter:
         
         for product_name, band_name, dtype in product_list:
             if band_name in cube.data:
-                filepath = self._make_filename(product_name, scene_id, date, 'tif')
+                filepath = self._make_filename(product_name, cube, date, 'tif')
                 write_geotiff(
                     str(filepath),
                     cube.data[band_name],
@@ -609,7 +652,7 @@ class OutputWriter:
         """
         stats = self.compute_statistics(cube)
 
-        filepath = self._make_filename('statistics', scene_id, date, 'csv')
+        filepath = self._make_filename('statistics', cube, date, 'csv')
         write_statistics_csv(str(filepath), stats)
         self.output_files.append(filepath)
 
@@ -639,7 +682,7 @@ class OutputWriter:
         Returns:
             Path to output file
         """
-        filepath = self._make_filename('metadata', scene_id, date, 'json')
+        filepath = self._make_filename('metadata', cube, date, 'json')
         write_metadata(
             str(filepath),
             cube,
@@ -680,7 +723,7 @@ class OutputWriter:
         if not bands_dict:
             raise ValueError("None of the specified bands are available")
         
-        filepath = self._make_filename(product_name, scene_id, date, 'tif')
+        filepath = self._make_filename(product_name, cube, date, 'tif')
         write_multiband_geotiff(str(filepath), bands_dict, cube, self.compression)
         self.output_files.append(filepath)
         
@@ -704,7 +747,7 @@ class OutputWriter:
         Returns:
             Path to output file
         """
-        filepath = self._make_filename(f'{scene_id}_ET', date, 'nc')
+        filepath = self._make_filename(f'{scene_id}_ET', cube, date, 'nc')
         write_netcdf(str(filepath), cube, variables)
         self.output_files.append(filepath)
         
@@ -717,3 +760,323 @@ class OutputWriter:
             List of output file paths
         """
         return self.output_files
+
+
+def write_product_metadata_geojson(
+    path: str,
+    product_name: str,
+    data: np.ndarray,
+    cube: DataCube,
+    aoi_id: str = "AOI",
+    masked_pixels_count: int = 0,
+    cloud_cover_percent: Optional[float] = None,
+    theoretical_range: tuple = (-1, 1)
+) -> None:
+    """Write product metadata to GeoJSON format.
+    
+    Creates a GeoJSON file containing metadata for a single product (CWSI, ETa, NDVI, etc.)
+    following the convention used in METRIC and other remote sensing pipelines.
+    
+    Args:
+        path: Output file path (should end with .geojson)
+        product_name: Name of the product (e.g., 'CWSI', 'ETaDaily', 'NDVI')
+        data: 2D numpy array of the product data
+        cube: DataCube containing metadata
+        aoi_id: Area of Interest identifier
+        masked_pixels_count: Number of masked pixels (cloud, water, etc.)
+        cloud_cover_percent: Cloud coverage percentage for the AOI
+        theoretical_range: Expected min/max values for the product (e.g., (0, 1) for CWSI)
+    
+    Example GeoJSON output structure:
+        {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {"type": "MultiPoint", "coordinates": []},
+                "properties": {
+                    "product_name": "CWSI",
+                    "platform": "landsat-8",
+                    "sensor": "oli",
+                    "sceneID": "LC08_L2SP_038166_20200105",
+                    "acquisition_date": "2020-01-05",
+                    "min_value": 0.1,
+                    "max_value": 0.9,
+                    "mean_value": 0.5,
+                    "masked_pixels": 150,
+                    "projection": "EPSG:32638",
+                    "spatial_resolution_m": 30.0,
+                    "AOI_ID": "amirkabir",
+                    "cloud_cover_percent": 15.5,
+                    "theoretical_range": "0 to 1"
+                }
+            }]
+        }
+    """
+    # Compute statistics
+    valid_data = data[~np.isnan(data)]
+    
+    if len(valid_data) > 0:
+        min_val = float(np.nanmin(valid_data))
+        max_val = float(np.nanmax(valid_data))
+        mean_val = float(np.nanmean(valid_data))
+    else:
+        min_val = max_val = mean_val = np.nan
+    
+    # Get spatial resolution from transform
+    resolution_m = 30.0  # Default for Landsat
+    if cube.transform is not None:
+        transform = cube.transform
+        if hasattr(transform, 'a'):
+            resolution_m = abs(transform.a)
+        else:
+            resolution_m = abs(transform[0])
+    
+    # Get projection
+    projection = str(cube.crs) if cube.crs else "EPSG:4326"
+    
+    # Get acquisition date
+    if cube.acquisition_time:
+        acquisition_date = cube.acquisition_time.strftime("%Y-%m-%d")
+    else:
+        acquisition_date = datetime.now().strftime("%Y-%m-%d")
+    
+    # Get scene ID (short form)
+    scene_id_raw = cube.metadata.get('scene_id', 'Unknown')
+    if '_' in scene_id_raw:
+        scene_id_short = scene_id_raw.split('_')[0]
+    else:
+        scene_id_short = scene_id_raw[:6] if len(scene_id_raw) >= 6 else scene_id_raw
+    
+    # Get platform and sensor
+    platform_raw = cube.metadata.get('platform', None)
+    sensor_raw = cube.metadata.get('sensor', None)
+    
+    # Normalize platform name
+    if platform_raw:
+        platform = str(platform_raw).lower().replace(' ', '-')
+    else:
+        platform = None
+    
+    # Normalize sensor name
+    if sensor_raw:
+        sensor = str(sensor_raw).lower().replace(' ', '_')
+    else:
+        sensor = None
+    
+    # Build theoretical range string
+    theoretical_range_str = f"{theoretical_range[0]} to {theoretical_range[1]}"
+    
+    # Create GeoJSON feature collection
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "geometry": {
+                "type": "MultiPoint",
+                "coordinates": []
+            },
+            "id": "0",
+            "properties": {
+                "product_name": product_name,
+                "platform": platform,
+                "sensor": sensor,
+                "sceneID": scene_id_short,
+                "acquisition_date": acquisition_date,
+                "min_value": min_val,
+                "max_value": max_val,
+                "mean_value": mean_val,
+                "masked_pixels": masked_pixels_count,
+                "projection": projection,
+                "spatial_resolution_m": resolution_m,
+                "AOI_ID": aoi_id,
+                "cloud_cover_percent": cloud_cover_percent,
+                "theoretical_range": theoretical_range_str
+            }
+        }]
+    }
+    
+    # Write to file
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(geojson, f, indent=2)
+
+
+class ProductMetadataWriter:
+    """Helper class for writing product-specific metadata GeoJSON files.
+    
+    Provides convenient methods for generating metadata files for common
+    METRIC products (CWSI, ETa, NDVI, etc.) with appropriate default values.
+    """
+    
+    # Product-specific configurations
+    PRODUCT_CONFIG = {
+        'CWSI': {
+            'theoretical_range': (0, 1),
+            'product_key': 'cwsi'
+        },
+        'ETaDaily': {
+            'theoretical_range': (0, 10),  # mm/day
+            'product_key': 'eta_daily'
+        },
+        'ETinst': {
+            'theoretical_range': (0, 1),  # fraction of ETr
+            'product_key': 'et_inst'
+        },
+        'ETrF': {
+            'theoretical_range': (0, 1.5),
+            'product_key': 'etrf'
+        },
+        'NDVI': {
+            'theoretical_range': (-1, 1),
+            'product_key': 'ndvi'
+        },
+        'LST': {
+            'theoretical_range': (250, 400),  # Kelvin
+            'product_key': 'lst'
+        },
+        'Albedo': {
+            'theoretical_range': (0, 1),
+            'product_key': 'albedo'
+        }
+    }
+    
+    def __init__(
+        self,
+        output_dir: str = ".",
+        aoi_name: str = "AOI"
+    ):
+        """Initialize the ProductMetadataWriter.
+        
+        Args:
+            output_dir: Base output directory for metadata files
+            aoi_name: Area of Interest name
+        """
+        self.output_dir = Path(output_dir)
+        self.aoi_name = aoi_name
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _make_geojson_path(self, product: str, cube: DataCube, date: str) -> Path:
+        """Generate path for GeoJSON metadata file."""
+        metadata = cube.metadata
+        
+        # Platform
+        platform_raw = metadata.get('platform', 'unknown')
+        if 'landsat-8' in str(platform_raw).lower():
+            platform = 'landsat8'
+        elif 'landsat-9' in str(platform_raw).lower():
+            platform = 'landsat9'
+        else:
+            platform = str(platform_raw).lower().replace(' ', '_')
+        
+        # Scene ID
+        scene_id_raw = metadata.get('scene_id', 'unknown')
+        if '_' in scene_id_raw:
+            scene_id_short = scene_id_raw.split('_')[0]
+        else:
+            scene_id_short = scene_id_raw[:6] if len(scene_id_raw) >= 6 else scene_id_raw
+        
+        # Build filename: META_PRODUCT_PLATFORM_SCENEID_DATE_AOI.geojson
+        filename = f"META_{product}_{platform}_{scene_id_short}_{date}_{self.aoi_name}.geojson"
+        return self.output_dir / filename
+    
+    def write_cwsi_metadata(
+        self,
+        data: np.ndarray,
+        cube: DataCube,
+        date: str,
+        masked_pixels_count: int = 0,
+        cloud_cover_percent: Optional[float] = None
+    ) -> str:
+        """Write CWSI product metadata to GeoJSON.
+        
+        Args:
+            data: CWSI data array
+            cube: DataCube containing metadata
+            date: Date string (YYYY-MM-DD)
+            masked_pixels_count: Number of masked pixels
+            cloud_cover_percent: Cloud coverage percentage
+            
+        Returns:
+            Path to output file
+        """
+        path = self._make_geojson_path('CWSI', cube, date)
+        write_product_metadata_geojson(
+            str(path),
+            product_name='CWSI',
+            data=data,
+            cube=cube,
+            aoi_id=self.aoi_name,
+            masked_pixels_count=masked_pixels_count,
+            cloud_cover_percent=cloud_cover_percent,
+            theoretical_range=self.PRODUCT_CONFIG['CWSI']['theoretical_range']
+        )
+        return str(path)
+    
+    def write_eta_daily_metadata(
+        self,
+        data: np.ndarray,
+        cube: DataCube,
+        date: str,
+        masked_pixels_count: int = 0,
+        cloud_cover_percent: Optional[float] = None
+    ) -> str:
+        """Write daily ETa product metadata to GeoJSON.
+        
+        Args:
+            data: Daily ETa data array (mm/day)
+            cube: DataCube containing metadata
+            date: Date string (YYYY-MM-DD)
+            masked_pixels_count: Number of masked pixels
+            cloud_cover_percent: Cloud coverage percentage
+            
+        Returns:
+            Path to output file
+        """
+        path = self._make_geojson_path('ETa', cube, date)
+        write_product_metadata_geojson(
+            str(path),
+            product_name='ETaDaily',
+            data=data,
+            cube=cube,
+            aoi_id=self.aoi_name,
+            masked_pixels_count=masked_pixels_count,
+            cloud_cover_percent=cloud_cover_percent,
+            theoretical_range=self.PRODUCT_CONFIG['ETaDaily']['theoretical_range']
+        )
+        return str(path)
+    
+    def write_custom_product_metadata(
+        self,
+        product_name: str,
+        data: np.ndarray,
+        cube: DataCube,
+        date: str,
+        masked_pixels_count: int = 0,
+        cloud_cover_percent: Optional[float] = None,
+        theoretical_range: tuple = (-1, 1)
+    ) -> str:
+        """Write custom product metadata to GeoJSON.
+        
+        Args:
+            product_name: Name of the product
+            data: Product data array
+            cube: DataCube containing metadata
+            date: Date string (YYYY-MM-DD)
+            masked_pixels_count: Number of masked pixels
+            cloud_cover_percent: Cloud coverage percentage
+            theoretical_range: Expected min/max range for the product
+            
+        Returns:
+            Path to output file
+        """
+        path = self._make_geojson_path(product_name.upper(), cube, date)
+        write_product_metadata_geojson(
+            str(path),
+            product_name=product_name,
+            data=data,
+            cube=cube,
+            aoi_id=self.aoi_name,
+            masked_pixels_count=masked_pixels_count,
+            cloud_cover_percent=cloud_cover_percent,
+            theoretical_range=theoretical_range
+        )
+        return str(path)

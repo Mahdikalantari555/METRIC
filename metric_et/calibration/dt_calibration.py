@@ -1181,68 +1181,23 @@ class DTCalibration:
                 total_pixels = ndvi.size
                 valid_pixel_fraction = valid_pixels / total_pixels
 
-            # Get QA coverage thresholds (same as in pipeline)
+            # Get QA coverage threshold
             qa_reject_threshold = 0.30  # Reject if QA < 0.30 (severe pixel loss)
-            qa_low_quality_threshold = 0.70  # Flag as LOW QUALITY if QA < 0.70
 
             if qa_pixel is not None:
                 logger.info(f"QA coverage (ROI-based): {valid_pixels}/{roi_pixels} = {valid_pixel_fraction:.3f}")
             else:
                 logger.info(f"QA coverage (array-based): {valid_pixels}/{total_pixels} = {valid_pixel_fraction:.3f}")
-            logger.info(f"Thresholds - Reject: <{qa_reject_threshold:.2f}, Low Quality: <{qa_low_quality_threshold:.2f}")
+            logger.info(f"Threshold - Reject: <{qa_reject_threshold:.2f}")
 
             if valid_pixel_fraction < qa_reject_threshold:
                 # Reject if more than 70% pixels lost (cloud masked)
                 return True, f"QA coverage too low (severe pixel loss): {valid_pixel_fraction:.3f} < {qa_reject_threshold:.2f}"
-            elif valid_pixel_fraction < qa_low_quality_threshold:
-                # Don't reject, but flag for LOW QUALITY - continue processing
-                logger.debug(f"QA coverage: {valid_pixel_fraction:.3f} < {qa_low_quality_threshold:.2f} - LOW QUALITY")
-                # Don't return here - continue with validation but will be marked as LOW QUALITY later
             
-            # 2. NDVI dynamic range check: NDVI_p95 - NDVI_p05 < 0.30
-            ndvi_values = ndvi.values[~np.isnan(ndvi.values)]
-            if len(ndvi_values) == 0:
-                return True, "No valid NDVI values for dynamic range check"
-            
-            ndvi_p5 = np.percentile(ndvi_values, 5)
-            ndvi_p95 = np.percentile(ndvi_values, 95)
-            ndvi_range = ndvi_p95 - ndvi_p5
-            
-            logger.info(f"NDVI dynamic range: P95={ndvi_p95:.3f}, P5={ndvi_p5:.3f}, range={ndvi_range:.3f}")
-            
-            if ndvi_range < 0.30:
-                return True, f"NDVI dynamic range too low: {ndvi_range:.3f} < 0.30"
-            
-            # 3. Net radiation sanity check: median(Rn) < 300 W/m²
-            rn_values = rn.values[~np.isnan(rn.values)]
-            if len(rn_values) == 0:
-                return True, "No valid Rn values for median check"
-            
-            rn_median = np.median(rn_values)
-            
-            logger.info(f"Net radiation median: {rn_median:.1f} W/m²")
-            
-            if rn_median < 300:
-                return True, f"Net radiation median too low: {rn_median:.1f} < 300 W/m²"
-            
-            # 4. ET0_inst sanity check: ET0_inst < 0.2 or > 1.0 mm/hr
-            et0_daily = float(np.nanmean(et0_daily_array.values))
-            rs_inst = float(np.nanmean(rs_inst_array.values))
-            rs_daily = float(np.nanmean(rs_daily_array.values))
-            
-            rs_daily_avg_w = rs_daily * MJ_M2_DAY_TO_W  # MJ/m²/day -> W/m²
-            
-            if rs_daily_avg_w <= 0:
-                return True, "Invalid daily shortwave radiation for ET0_inst calculation"
-            
-            radiation_ratio = rs_inst / rs_daily_avg_w
-            et0_inst = et0_daily * radiation_ratio / 24.0  # mm/day -> mm/hr
-            
-            logger.info(f"ET0_inst: {et0_inst:.3f} mm/hr")
-            
-            if et0_inst < 0.1 or et0_inst > 1.8:
-                return True, f"ET0_inst out of range: {et0_inst:.3f} mm/hr (must be 0.1-1.5)"
-            
+            # NOTE: NDVI dynamic range, Net radiation, and ET0_inst checks have been removed
+            # to allow all scenes to proceed to ET calculation regardless of these metrics
+            # Only severe QA issues (< 0.30) trigger rejection
+
             logger.info("Scene-level pre-validation passed")
             return False, ""
             
