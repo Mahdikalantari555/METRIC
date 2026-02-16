@@ -28,6 +28,7 @@ Quality Classes:
 from .instantaneous_et import InstantaneousET, create_instantaneous_et
 from .daily_et import DailyET, create_daily_et
 from .quality import ETQuality, ETQualityClass, create_et_quality
+from .extrapolation import ETExtrapolator, create_extrapolator
 
 __all__ = [
     'InstantaneousET',
@@ -36,5 +37,7 @@ __all__ = [
     'create_daily_et',
     'ETQuality',
     'ETQualityClass',
-    'create_et_quality'
+    'create_et_quality',
+    'ETExtrapolator',
+    'create_extrapolator'
 ]

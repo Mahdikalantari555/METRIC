@@ -167,7 +167,7 @@ class METRICPipeline:
             # Initialize dynamic weather fetcher
             from ..io.dynamic_weather_fetcher import DynamicWeatherFetcher
             weather_config = self.config.get('weather', {})
-            grid_spacing = weather_config.get('grid_spacing_km', 9.0)
+            grid_spacing = weather_config.get('grid_spacing_km', 9.0) 
             weather_fetcher = DynamicWeatherFetcher(grid_spacing_km=grid_spacing)
 
             try:
@@ -1352,3 +1352,4 @@ class METRICPipeline:
             logger.error(f"Error in clip_outputs_to_aoi: {e}")
             # Don't raise exception to avoid breaking the pipeline
             logger.warning("Continuing pipeline execution")
+
