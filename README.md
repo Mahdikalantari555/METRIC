@@ -340,7 +340,6 @@ for date in scene_dates:
 | SWIR-1 | `swir16.tif` | Shortwave IR-1 | 30m |
 | SWIR-2 | `swir22.tif` | Shortwave IR-2 | 30m |
 | Thermal | `lwir11.tif` | Thermal infrared | 100m (resampled) |
-| QA | `qa.tif` | Quality assessment | 30m |
 | QA Pixel | `qa_pixel.tif` | Pixel quality | 30m |
 
 **Metadata File**: `MTL.json` (required)
@@ -366,17 +365,6 @@ datetime,temperature_2m,relative_humidity,wind_speed,pressure,solar_radiation
 - `wind_speed`: Wind speed at 10m (m/s)
 - `pressure`: Atmospheric pressure (hPa)
 - `solar_radiation`: Incoming solar radiation (W/m²)
-
-### DEM Requirements
-
-**Optional**: Digital Elevation Model for terrain correction
-
-**Format**: GeoTIFF with the same CRS and resolution as Landsat data
-
-**Fields**:
-- Elevation (meters above sea level)
-- Slope (degrees)
-- Aspect (degrees)
 
 ### Coordinate Systems
 
