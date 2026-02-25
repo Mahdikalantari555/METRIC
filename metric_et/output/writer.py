@@ -90,6 +90,103 @@ def write_geotiff(
         )
 
 
+def write_rgb_geotiff(
+    path: str,
+    red: np.ndarray,
+    green: np.ndarray,
+    blue: np.ndarray,
+    cube: DataCube,
+    compression: str = "LZW",
+    stretch_percentiles: tuple = (2, 98)
+) -> None:
+    """Write 3-band RGB GeoTIFF with CRS and transform from DataCube.
+    
+    This function creates a true-color RGB image from Landsat red, green, and blue bands.
+    The data is stretched to enhance visual contrast using percentile-based stretching.
+    
+    Args:
+        path: Output file path
+        red: 2D numpy array for red band
+        green: 2D numpy array for green band
+        blue: 2D numpy array for blue band
+        cube: DataCube containing CRS and transform information
+        compression: Compression algorithm (default: LZW)
+        stretch_percentiles: Tuple of (lower, upper) percentiles for stretching (default: 2, 98)
+    """
+    # Get CRS and transform from DataCube
+    crs = cube.crs
+    transform = cube.transform
+    
+    if crs is None or transform is None:
+        raise ValueError("DataCube must have CRS and transform set")
+    
+    # Check all bands have same shape
+    shapes = [red.shape, green.shape, blue.shape]
+    if len(set(shapes)) > 1:
+        raise ValueError("All RGB bands must have the same shape")
+    
+    height, width = red.shape
+    
+    def stretch_band(band_data, lower_pct=2, upper_pct=98):
+        """Apply percentile-based stretching to enhance contrast."""
+        # Handle NaN values
+        valid_data = band_data[~np.isnan(band_data)]
+        if len(valid_data) == 0:
+            return np.zeros_like(band_data, dtype=np.uint8)
+        
+        # Calculate percentiles
+        p_low, p_high = np.percentile(valid_data, (lower_pct, upper_pct))
+        
+        if p_high - p_low == 0:
+            return np.zeros_like(band_data, dtype=np.uint8)
+        
+        # Stretch to 0-255 range
+        stretched = (band_data - p_low) / (p_high - p_low)
+        stretched = np.clip(stretched, 0, 1)
+        
+        # Handle NaN - set to 0
+        stretched = np.where(np.isnan(band_data), 0, stretched)
+        
+        return (stretched * 255).astype(np.uint8)
+    
+    # Apply stretching to each band
+    red_stretched = stretch_band(red, stretch_percentiles[0], stretch_percentiles[1])
+    green_stretched = stretch_band(green, stretch_percentiles[0], stretch_percentiles[1])
+    blue_stretched = stretch_band(blue, stretch_percentiles[0], stretch_percentiles[1])
+    
+    # Write 3-band RGB GeoTIFF
+    with rasterio.open(
+        path,
+        'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=3,
+        dtype='uint8',
+        crs=crs,
+        transform=transform,
+        compress=compression,
+        photometric='RGB'
+    ) as dst:
+        # Write bands in RGB order (band 1=Red, band 2=Green, band 3=Blue)
+        dst.write(red_stretched, 1)
+        dst.write(green_stretched, 2)
+        dst.write(blue_stretched, 3)
+        
+        # Set band descriptions
+        dst.set_band_description(1, 'Red')
+        dst.set_band_description(2, 'Green')
+        dst.set_band_description(3, 'Blue')
+        
+        # Add metadata
+        dst.update_tags(
+            DATE=datetime.now().isoformat(),
+            SENSOR=cube.metadata.get('sensor', 'Unknown'),
+            PRODUCT='RGB_TrueColor',
+            STRETCH=f'{stretch_percentiles[0]}-{stretch_percentiles[1]} percentile'
+        )
+
+
 def write_multiband_geotiff(
     path: str,
     bands_dict: Dict[str, np.ndarray],
@@ -433,7 +530,6 @@ class OutputWriter:
             ('Albedo', 'albedo', 'float32'),
             ('LST', 'lst', 'float32'),
             ('LAI', 'lai', 'float32'),
-            ('AirTemp', 'temperature_2m', 'float32')
         ]
     }
     
@@ -760,6 +856,60 @@ class OutputWriter:
             List of output file paths
         """
         return self.output_files
+    
+    def write_rgb_image(
+        self,
+        cube: DataCube,
+        scene_id: str,
+        date: str,
+        red_band: str = 'red',
+        green_band: str = 'green',
+        blue_band: str = 'blue'
+    ) -> Optional[str]:
+        """Write RGB true-color GeoTIFF from Landsat bands.
+        
+        Args:
+            cube: DataCube containing the RGB bands
+            scene_id: Scene identifier
+            date: Date string (YYYYMMDD)
+            red_band: Name of the red band in cube (default: 'red')
+            green_band: Name of the green band in cube (default: 'green')
+            blue_band: Name of the blue band in cube (default: 'blue')
+        
+        Returns:
+            Path to output file, or None if bands not available
+        """
+        # Check if required bands are available
+        red_data = cube.data.get(red_band)
+        green_data = cube.data.get(green_band)
+        blue_data = cube.data.get(blue_band)
+        
+        if red_data is None or green_data is None or blue_data is None:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"RGB bands not available in cube. Requested: {red_band}, {green_band}, {blue_band}")
+            logger.warning(f"Available bands: {list(cube.data.keys())}")
+            return None
+        
+        # Extract numpy arrays
+        red_array = red_data.values if hasattr(red_data, 'values') else red_data
+        green_array = green_data.values if hasattr(green_data, 'values') else green_data
+        blue_array = blue_data.values if hasattr(blue_data, 'values') else blue_data
+        
+        # Generate filename
+        filepath = self._make_filename('RGB', cube, date, 'tif')
+        
+        # Write RGB GeoTIFF
+        write_rgb_geotiff(
+            str(filepath),
+            red_array,
+            green_array,
+            blue_array,
+            cube,
+            compression=self.compression
+        )
+        
+        self.output_files.append(filepath)
+        return str(filepath)
 
 
 def write_product_metadata_geojson(

@@ -1,6 +1,7 @@
 """METRIC ETa processing pipeline."""
 
 from typing import Dict, Optional, Tuple, Union, Any
+from datetime import datetime
 import numpy as np
 import xarray as xr
 from loguru import logger
@@ -94,9 +95,26 @@ class METRICPipeline:
             logger.error(f"Pipeline execution failed: {e}")
             raise
     
-    def load_data(self, landsat_dir: str, meteo_data: Dict, dem_path: Optional[str] = None, roi_path: Optional[str] = None) -> None:
-        """Load input data into DataCube."""
-        from ..io import LandsatReader, MeteoReader
+    def load_data(
+        self,
+        landsat_source: Union[str, Dict],
+        meteo_data: Dict,
+        dem_path: Optional[str] = None,
+        roi_path: Optional[str] = None
+    ) -> None:
+        """Load input data into DataCube from various sources.
+        
+        Args:
+            landsat_source: Either:
+                - str: Path to local Landsat scene directory (backward compatible)
+                - dict: Configuration dict with 'type' key specifying source:
+                    {'type': 'local', 'path': '/data/scene'}
+                    {'type': 'planetary_computer', 'roi': {...}, 'date': '2023-04-27', ...}
+            meteo_data: Meteorological data dictionary
+            dem_path: Path to DEM file (optional)
+            roi_path: Path to ROI GeoJSON (optional, for clipping)
+        """
+        from ..io import LandsatReader, MeteoReader, PlanetaryComputerLandsatFetcher
         from ..core.datacube import DataCube
         import os
         import logging
@@ -108,98 +126,273 @@ class METRICPipeline:
             # Initialize DataCube
             self.data = DataCube()
 
-            # Load Landsat data
-            logger.info(f"Loading Landsat data from {landsat_dir}")
-            # Check if custom band mapping is provided in config
-            band_mapping = self.config.get('band_mapping')
-            landsat_reader = LandsatReader(band_mapping=band_mapping) if band_mapping else LandsatReader()
-            landsat_cube = landsat_reader.load(landsat_dir)
-
-            # Load ROI geometry for later use in final clipping (not for initial data loading)
-            roi_path = roi_path or self.roi_path or "amirkabir.geojson"
-            import geopandas as gpd
-            roi_gdf = gpd.read_file(roi_path)
-            # Reproject ROI to match raster CRS from DataCube
-            roi_gdf = roi_gdf.to_crs(landsat_cube.crs)
-            self._roi_geom = roi_gdf.geometry.iloc[0]  # Store ROI geometry for later use
-            logger.info("Loaded ROI geometry for final clipping")
-
-            # Copy Landsat data to main cube
-            for band_name in landsat_cube.bands():
-                band_data = landsat_cube.get(band_name)
-                # Ensure rioxarray integration is available for spatial operations
-                if not hasattr(band_data, 'rio'):
-                    import rioxarray
-                    band_data = band_data.rio.write_crs(landsat_cube.crs)
-                self.data.add(band_name, band_data)
-
-            # Copy metadata
-            self.data.metadata.update(landsat_cube.metadata)
-            self.data.crs = landsat_cube.crs
-            self.data.transform = landsat_cube.transform
-            self.data.extent = landsat_cube.extent
-            self.data.acquisition_time = landsat_cube.acquisition_time
-
-            # Fix acquisition time if it's at midnight (no time info in MTL)
-            if self.data.acquisition_time and self.data.acquisition_time.time() == datetime.min.time():
-                # Assume Landsat overpass time of 10:30 (typical for Landsat 8/9)
-                overpass_time = datetime.strptime("10:30", "%H:%M").time()
-                self.data.acquisition_time = datetime.combine(self.data.acquisition_time.date(), overpass_time)
-                logger.info(f"Adjusted acquisition time to {self.data.acquisition_time}")
-
-            # Load weather data dynamically from Open-Meteo API
-            logger.info("Fetching meteorological data from Open-Meteo API")
-
-            # Get target coordinates from Landsat data
-            sample_band = next(iter(self.data.data.values()))
-            target_coords = {dim: sample_band.coords[dim] for dim in sample_band.dims}
-
-            # Get full scene extent and convert to lat/lon for weather fetching
-            full_scene_bounds = self.data.extent  # (min_x, min_y, max_x, max_y) in projected CRS
-            from pyproj import Transformer
-            # Create transformer from data CRS to WGS84
-            transformer = Transformer.from_crs(self.data.crs, "EPSG:4326", always_xy=True)
-            # Transform corners
-            min_lon, min_lat = transformer.transform(full_scene_bounds[0], full_scene_bounds[1])
-            max_lon, max_lat = transformer.transform(full_scene_bounds[2], full_scene_bounds[3])
-            full_scene_extent = (min_lon, min_lat, max_lon, max_lat)
-
-            # Initialize dynamic weather fetcher
-            from ..io.dynamic_weather_fetcher import DynamicWeatherFetcher
-            weather_config = self.config.get('weather', {})
-            grid_spacing = weather_config.get('grid_spacing_km', 9.0) 
-            weather_fetcher = DynamicWeatherFetcher(grid_spacing_km=grid_spacing)
-
-            try:
-                # Fetch spatially varying weather data using full scene extent
-                weather_arrays = weather_fetcher.fetch_weather_for_scene(
-                    landsat_dir, target_coords, full_scene_extent
+            # Determine source type and load accordingly
+            if isinstance(landsat_source, str):
+                # Local directory (backward compatible)
+                logger.info(f"Loading Landsat data from local directory: {landsat_source}")
+                self._load_from_local_directory(landsat_source, meteo_data, roi_path)
+            elif isinstance(landsat_source, dict):
+                source_type = landsat_source.get('type')
+                if source_type == 'local':
+                    path = landsat_source.get('path')
+                    if not path:
+                        raise ValueError("Local source requires 'path' in config")
+                    logger.info(f"Loading Landsat data from local path (config): {path}")
+                    self._load_from_local_directory(path, meteo_data, roi_path)
+                elif source_type == 'planetary_computer':
+                    logger.info("Loading Landsat data from Planetary Computer")
+                    self._load_from_planetary_computer(landsat_source, meteo_data, roi_path)
+                else:
+                    raise ValueError(f"Unknown source type: {source_type}")
+            else:
+                raise TypeError(
+                    f"landsat_source must be str or dict, got {type(landsat_source)}"
                 )
-
-                # Convert temperature from Celsius to Kelvin
-                if "temperature_2m" in weather_arrays:
-                    weather_arrays["temperature_2m"] = weather_arrays["temperature_2m"] + 273.15
-
-                # Add weather data to cube
-                for var_name, array in weather_arrays.items():
-                    self.data.add(var_name, array)
-
-                logger.info(f"Spatially varying weather data loaded for {len(weather_arrays)} variables using full scene extent")
-
-            except Exception as e:
-                logger.error(f"Failed to fetch dynamic weather data: {e}")
-                raise
-
-            # TODO: Load DEM if provided
-            if dem_path:
-                logger.warning("DEM loading not implemented yet")
-
+            
             logger.info("Data loading completed successfully")
-
+            
         except Exception as e:
             logger.error(f"Error loading data: {e}")
             raise
     
+    def _load_from_local_directory(
+        self,
+        scene_path: str,
+        meteo_data: Dict,
+        roi_path: Optional[str]
+    ) -> None:
+        """Load Landsat data from a local directory (original implementation).
+        
+        Args:
+            scene_path: Path to Landsat scene directory
+            meteo_data: Meteorological data dictionary
+            roi_path: Path to ROI GeoJSON
+        """
+        from ..io import LandsatReader
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Load Landsat data
+        band_mapping = self.config.get('band_mapping')
+        landsat_reader = LandsatReader(band_mapping=band_mapping) if band_mapping else LandsatReader()
+        landsat_cube = landsat_reader.load(scene_path)
+
+        # Load ROI geometry for later use in final clipping (not for initial data loading)
+        roi_path = roi_path or self.roi_path or "amirkabir.geojson"
+        import geopandas as gpd
+        roi_gdf = gpd.read_file(roi_path)
+        # Reproject ROI to match raster CRS from DataCube
+        roi_gdf = roi_gdf.to_crs(landsat_cube.crs)
+        self._roi_geom = roi_gdf.geometry.iloc[0]  # Store ROI geometry for later use
+        logger.info("Loaded ROI geometry for final clipping")
+
+        # Copy Landsat data to main cube
+        for band_name in landsat_cube.bands():
+            band_data = landsat_cube.get(band_name)
+            # Ensure rioxarray integration is available for spatial operations
+            if not hasattr(band_data, 'rio'):
+                import rioxarray
+                band_data = band_data.rio.write_crs(landsat_cube.crs)
+            self.data.add(band_name, band_data)
+
+        # Copy metadata
+        self.data.metadata.update(landsat_cube.metadata)
+        self.data.crs = landsat_cube.crs
+        self.data.transform = landsat_cube.transform
+        self.data.extent = landsat_cube.extent
+        self.data.acquisition_time = landsat_cube.acquisition_time
+
+        # Fix acquisition time if it's at midnight (no time info in MTL)
+        if self.data.acquisition_time and self.data.acquisition_time.time() == datetime.min.time():
+            # Assume Landsat overpass time of 10:30 (typical for Landsat 8/9)
+            overpass_time = datetime.strptime("10:30", "%H:%M").time()
+            self.data.acquisition_time = datetime.combine(self.data.acquisition_time.date(), overpass_time)
+            logger.info(f"Adjusted acquisition time to {self.data.acquisition_time}")
+
+        # Load weather data dynamically from Open-Meteo API
+        logger.info("Fetching meteorological data from Open-Meteo API")
+
+        # Get target coordinates from Landsat data
+        sample_band = next(iter(self.data.data.values()))
+        target_coords = {dim: sample_band.coords[dim] for dim in sample_band.dims}
+
+        # Get full scene extent and convert to lat/lon for weather fetching
+        full_scene_bounds = self.data.extent  # (min_x, min_y, max_x, max_y) in projected CRS
+        from pyproj import Transformer
+        # Create transformer from data CRS to WGS84
+        transformer = Transformer.from_crs(self.data.crs, "EPSG:4326", always_xy=True)
+        # Transform corners
+        min_lon, min_lat = transformer.transform(full_scene_bounds[0], full_scene_bounds[1])
+        max_lon, max_lat = transformer.transform(full_scene_bounds[2], full_scene_bounds[3])
+        full_scene_extent = (min_lon, min_lat, max_lon, max_lat)
+
+        # Initialize dynamic weather fetcher
+        from ..io.dynamic_weather_fetcher import DynamicWeatherFetcher
+        weather_config = self.config.get('weather', {})
+        grid_spacing = weather_config.get('grid_spacing_km', 9.0)
+        weather_fetcher = DynamicWeatherFetcher(grid_spacing_km=grid_spacing)
+
+        try:
+            # Fetch spatially varying weather data using full scene extent
+            # Pass the target CRS to transform coordinates from projected CRS to WGS84
+            weather_arrays = weather_fetcher.fetch_weather_for_scene(
+                scene_path, target_coords, full_scene_extent, target_crs=self.data.crs
+            )
+
+            # Convert temperature from Celsius to Kelvin
+            if "temperature_2m" in weather_arrays:
+                weather_arrays["temperature_2m"] = weather_arrays["temperature_2m"] + 273.15
+
+            # Add weather data to cube
+            for var_name, array in weather_arrays.items():
+                self.data.add(var_name, array)
+
+            logger.info(f"Spatially varying weather data loaded for {len(weather_arrays)} variables using full scene extent")
+
+        except Exception as e:
+            logger.error(f"Failed to fetch dynamic weather data: {e}")
+            raise
+    
+    def _load_from_planetary_computer(
+        self,
+        config: Dict,
+        meteo_data: Dict,
+        roi_path: Optional[str]
+    ) -> None:
+        """Load Landsat data from Planetary Computer.
+        
+        Args:
+            config: Configuration dictionary with keys:
+                - roi: GeoJSON geometry dict or shapely geometry (REQUIRED)
+                - date: Target date string 'YYYY-MM-DD' (REQUIRED)
+                - max_cloud_cover: Maximum cloud cover percentage (optional, default 70.0)
+                - cache_dir: Cache directory path (optional)
+                - use_cache: Whether to use cache (optional, default True)
+            meteo_data: Meteorological data dictionary (currently not used, weather fetched dynamically)
+            roi_path: Path to ROI GeoJSON (optional, for clipping)
+        """
+        from ..io import PlanetaryComputerLandsatFetcher
+        import logging
+        from datetime import datetime, timedelta
+        logger = logging.getLogger(__name__)
+
+        # Extract required config
+        if 'roi' not in config:
+            raise ValueError("Planetary Computer source requires 'roi' in config")
+        if 'date' not in config:
+            raise ValueError("Planetary Computer source requires 'date' in config")
+        
+        roi_geometry = config['roi']
+        target_date_str = config['date']
+        max_cloud_cover = config.get('max_cloud_cover', 70.0)
+        cache_dir = config.get('cache_dir')
+        use_cache = config.get('use_cache', True)
+        
+        # Parse target date
+        try:
+            target_date = datetime.fromisoformat(target_date_str)
+        except ValueError:
+            raise ValueError(f"Invalid date format: {target_date_str}. Use YYYY-MM-DD")
+        
+        # Create date range (single day, but can be expanded with fallback)
+        # For now, just use the single date. Could add fallback logic later.
+        date_range = (target_date, target_date + timedelta(days=1) - timedelta(seconds=1))
+        
+        # Initialize fetcher
+        logger.info(f"Initializing PlanetaryComputerLandsatFetcher")
+        fetcher = PlanetaryComputerLandsatFetcher(
+            max_cloud_cover=max_cloud_cover,
+            cache_dir=cache_dir,
+            use_cache=use_cache
+        )
+        
+        # Fetch scenes (will return list, typically one scene for a single date)
+        logger.info(f"Fetching scenes from Planetary Computer for ROI and date {target_date_str}")
+        try:
+            datacubes = fetcher.fetch_scenes(
+                roi_geometry=roi_geometry,
+                date_range=date_range,
+                min_cloud_cover=0.0,
+                sort_by='date'
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch scenes from Planetary Computer: {e}")
+            raise
+                
+        # For now, take the first (best) scene if multiple are returned
+        # In the future, could handle multiple scenes differently
+        cube = datacubes[0]
+        if len(datacubes) > 1:
+            logger.warning(f"Found {len(datacubes)} scenes, using the first one (by date). "
+                          "Consider refining date range or cloud cover filter.")
+        
+        # Store the cube in self.data
+        self.data = cube
+        
+        # Load ROI geometry for clipping (use provided roi_path or extract from config)
+        if roi_path:
+            roi_clip_path = roi_path
+        elif 'roi_path' in config:
+            roi_clip_path = config['roi_path']
+        else:
+            # Try to use a default ROI file if available
+            roi_clip_path = self.roi_path or "amirkabir.geojson"
+        
+        # Load ROI for clipping
+        try:
+            import geopandas as gpd
+            roi_gdf = gpd.read_file(roi_clip_path)
+            # Reproject ROI to match raster CRS from DataCube
+            roi_gdf = roi_gdf.to_crs(cube.crs)
+            self._roi_geom = roi_gdf.geometry.iloc[0]
+            logger.info("Loaded ROI geometry for clipping")
+        except Exception as e:
+            logger.warning(f"Failed to load ROI for clipping: {e}. Proceeding without ROI clipping.")
+            self._roi_geom = None
+        
+        # Weather data: For Planetary Computer, we still need to fetch weather dynamically
+        # Get full scene extent and convert to lat/lon for weather fetching
+        full_scene_bounds = cube.extent  # (min_x, min_y, max_x, max_y) in projected CRS
+        from pyproj import Transformer
+        # Create transformer from data CRS to WGS84
+        transformer = Transformer.from_crs(cube.crs, "EPSG:4326", always_xy=True)
+        # Transform corners
+        min_lon, min_lat = transformer.transform(full_scene_bounds[0], full_scene_bounds[1])
+        max_lon, max_lat = transformer.transform(full_scene_bounds[2], full_scene_bounds[3])
+        full_scene_extent = (min_lon, min_lat, max_lon, max_lat)
+        
+        # Get target coordinates from cube
+        sample_band = next(iter(cube.data.values()))
+        target_coords = {dim: sample_band.coords[dim] for dim in sample_band.dims}
+        
+        # Initialize dynamic weather fetcher
+        from ..io.dynamic_weather_fetcher import DynamicWeatherFetcher
+        weather_config = self.config.get('weather', {})
+        grid_spacing = weather_config.get('grid_spacing_km', 9.0)
+        weather_fetcher = DynamicWeatherFetcher(grid_spacing_km=grid_spacing)
+        
+        try:
+            # Fetch spatially varying weather data using full scene extent
+            weather_arrays = weather_fetcher.fetch_weather_for_scene(
+                target_date_str, target_coords, full_scene_extent, target_crs=cube.crs
+            )
+            
+            # Convert temperature from Celsius to Kelvin
+            if "temperature_2m" in weather_arrays:
+                weather_arrays["temperature_2m"] = weather_arrays["temperature_2m"] + 273.15
+            
+            # Add weather data to cube
+            for var_name, array in weather_arrays.items():
+                self.data.add(var_name, array)
+            
+            logger.info(f"Spatially varying weather data loaded for {len(weather_arrays)} variables")
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch dynamic weather data: {e}")
+            raise
+        
+        logger.info("Planetary Computer data loading completed successfully")
+
     def preprocess(self) -> None:
         """Apply preprocessing."""
         import logging
@@ -1207,7 +1400,7 @@ class METRICPipeline:
             products_to_use = output_products or config_output_products
             
             # Determine if surface properties should be included
-            include_surface = self.config.get('include_surface_properties', False)
+            include_surface = self.config.get('include_surface_properties', True)
             
             # Get AOI name from config or ROI path
             aoi_name = self.config.get('aoi_name', 'AOI')
@@ -1261,6 +1454,16 @@ class METRICPipeline:
             )
             
             logger.info(f"ET products saved: {list(output_files.keys())}")
+
+            # Write RGB true-color image
+            rgb_file = writer.write_rgb_image(
+                self.data, scene_id, date_str,
+                red_band='red', green_band='green', blue_band='blue'
+            )
+            if rgb_file:
+                logger.info(f"RGB image saved: {rgb_file}")
+            else:
+                logger.warning("RGB image not saved - required bands not available")
 
             # Create visualizations
             viz = Visualization(output_dir=output_dir)

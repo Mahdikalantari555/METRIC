@@ -46,7 +46,7 @@ class DynamicWeatherFetcher:
         """
         self.grid_spacing_km = grid_spacing_km
 
-    def fetch_weather_for_scene(self, landsat_dir: str, target_coords: Dict, actual_extent: Tuple = None) -> Dict[str, xr.DataArray]:
+    def fetch_weather_for_scene(self, landsat_dir: str, target_coords: Dict, actual_extent: Tuple = None, target_crs: str = None) -> Dict[str, xr.DataArray]:
         """
         Fetch weather data for a Landsat scene and interpolate to target grid.
 
@@ -54,6 +54,7 @@ class DynamicWeatherFetcher:
             landsat_dir: Path to Landsat scene directory
             target_coords: Target coordinates dict with 'y', 'x' arrays
             actual_extent: Actual processed extent (min_lon, min_lat, max_lon, max_lat) or None to use MTL bbox
+            target_crs: CRS of the target coordinates (e.g., 'EPSG:32639' for UTM Zone 39N)
 
         Returns:
             Dictionary of weather variable DataArrays on target grid
@@ -96,7 +97,7 @@ class DynamicWeatherFetcher:
         logger.info(f"Successfully fetched data for {len(weather_data['valid_points'])} points")
 
         # Interpolate to target grid
-        result = self._interpolate_to_target_grid(weather_data, weather_data['valid_points'], target_coords)
+        result = self._interpolate_to_target_grid(weather_data, weather_data['valid_points'], target_coords, target_crs)
 
         return result
 
@@ -150,32 +151,138 @@ class DynamicWeatherFetcher:
         return weather_data
 
     def _interpolate_to_target_grid(self, weather_data: Dict, points: List[Tuple[float, float]],
-                                   target_coords: Dict) -> Dict[str, xr.DataArray]:
+                                   target_coords: Dict, target_crs: str = None) -> Dict[str, xr.DataArray]:
         """
         Interpolate weather data from grid points to target spatial grid.
 
         Args:
             weather_data: Dict of variable arrays at grid points
-            points: List of (lat, lon) tuples for grid points
+            points: List of (lat, lon) tuples for grid points (in WGS84)
             target_coords: Target coordinates dict with 'y', 'x' arrays
+            target_crs: CRS of the target coordinates (e.g., 'EPSG:32639' for UTM Zone 39N)
 
         Returns:
             Dictionary of interpolated DataArrays
         """
-        # Extract target lat/lon grids
-        target_lats = target_coords['y']  # Assuming 'y' is latitude
-        target_lons = target_coords['x']  # Assuming 'x' is longitude
-
-        # Handle different coordinate types (numpy arrays vs xarray DataArrays)
-        if hasattr(target_lats, 'values'):
-            target_lats_array = target_lats.values
-        else:
-            target_lats_array = target_lats
+        # Store original target coordinates BEFORE transformation
+        # These are the projected coordinates (e.g., UTM meters) that match Landsat data
+        if target_crs and target_crs != "EPSG:4326":
+            # Save original coordinates for use in DataArray creation
+            original_y_coords = target_coords['y']
+            original_x_coords = target_coords['x']
             
-        if hasattr(target_lons, 'values'):
-            target_lons_array = target_lons.values
+            # Handle coordinate types (numpy arrays vs xarray DataArrays)
+            if hasattr(original_y_coords, 'values'):
+                original_y_array = original_y_coords.values
+            else:
+                original_y_array = np.array(original_y_coords)
+                
+            if hasattr(original_x_coords, 'values'):
+                original_x_array = original_x_coords.values
+            else:
+                original_x_array = np.array(original_x_coords)
+            
+            logger.debug(f"Original target coords - y shape: {original_y_array.shape}, x shape: {original_x_array.shape}")
         else:
-            target_lons_array = target_lons
+            # No transformation - coordinates are already in lat/lon
+            original_y_coords = target_coords['y']
+            original_x_coords = target_coords['x']
+        
+        # Transform target coordinates from projected CRS to WGS84 lat/lon if needed
+        # Target coordinates come from Landsat data which is typically in a projected CRS (e.g., UTM in meters)
+        # Weather data from Open-Meteo is in WGS84 lat/lon degrees
+        if target_crs and target_crs != "EPSG:4326":
+            from pyproj import Transformer
+            # Create transformer from target CRS to WGS84
+            transformer = Transformer.from_crs(target_crs, "EPSG:4326", always_xy=True)
+            
+            # Extract target coordinate arrays
+            target_lats_raw = target_coords['y']
+            target_lons_raw = target_coords['x']
+            
+            # Handle different coordinate types (numpy arrays vs xarray DataArrays)
+            if hasattr(target_lats_raw, 'values'):
+                target_lats_array = target_lats_raw.values
+                lats_is_dataarray = True
+            else:
+                target_lats_array = np.array(target_lats_raw)
+                lats_is_dataarray = False
+                
+            if hasattr(target_lons_raw, 'values'):
+                target_lons_array = target_lons_raw.values
+                lons_is_dataarray = True
+            else:
+                target_lons_array = np.array(target_lons_raw)
+                lons_is_dataarray = False
+            
+            logger.debug(f"Original target coords - lat range: [{target_lats_array.min()}, {target_lats_array.max()}], lon range: [{target_lons_array.min()}, {target_lons_array.max()}]")
+            logger.debug(f"Target CRS: {target_crs}")
+            
+            # Transform coordinates from projected CRS to WGS84
+            # Handle both 1D and 2D coordinate arrays
+            if target_lats_array.ndim == 1 and target_lons_array.ndim == 1:
+                # 1D coordinates - transform each point
+                lons_wgs84 = np.zeros_like(target_lons_array)
+                lats_wgs84 = np.zeros_like(target_lats_array)
+                for i, (x, y) in enumerate(zip(target_lons_array, target_lats_array)):
+                    lons_wgs84[i], lats_wgs84[i] = transformer.transform(x, y)
+                target_lons_array = lons_wgs84
+                target_lats_array = lats_wgs84
+            elif target_lats_array.ndim == 2 and target_lons_array.ndim == 2:
+                # 2D coordinates - transform each point
+                target_lons_wgs84 = np.zeros_like(target_lons_array)
+                target_lats_wgs84 = np.zeros_like(target_lats_array)
+                for i in range(target_lats_array.shape[0]):
+                    for j in range(target_lats_array.shape[1]):
+                        target_lons_wgs84[i, j], target_lats_wgs84[i, j] = transformer.transform(
+                            target_lons_array[i, j], target_lats_array[i, j]
+                        )
+                target_lons_array = target_lons_wgs84
+                target_lats_array = target_lats_wgs84
+            else:
+                # Mixed dimensions - flatten, transform, reshape
+                if target_lats_array.ndim == 1:
+                    lon_grid, lat_grid = np.meshgrid(target_lons_array, target_lats_array)
+                    flat_lons = lon_grid.flatten()
+                    flat_lats = lat_grid.flatten()
+                    flat_lons_wgs84 = np.zeros_like(flat_lons)
+                    flat_lats_wgs84 = np.zeros_like(flat_lats)
+                    for i, (x, y) in enumerate(zip(flat_lons, flat_lats)):
+                        flat_lons_wgs84[i], flat_lats_wgs84[i] = transformer.transform(x, y)
+                    target_lons_array = flat_lons_wgs84.reshape(lon_grid.shape)
+                    target_lats_array = flat_lats_wgs84.reshape(lat_grid.shape)
+                else:
+                    # lat is already 2D
+                    flat_lons = target_lons_array.flatten()
+                    flat_lats = target_lats_array.flatten()
+                    flat_lons_wgs84 = np.zeros_like(flat_lons)
+                    flat_lats_wgs84 = np.zeros_like(flat_lats)
+                    for i, (x, y) in enumerate(zip(flat_lons, flat_lats)):
+                        flat_lons_wgs84[i], flat_lats_wgs84[i] = transformer.transform(x, y)
+                    target_lons_array = flat_lons_wgs84.reshape(target_lons_array.shape)
+                    target_lats_array = flat_lats_wgs84.reshape(target_lats_array.shape)
+            
+            logger.debug(f"Transformed target coords - lat range: [{target_lats_array.min():.4f}, {target_lats_array.max():.4f}], lon range: [{target_lons_array.min():.4f}, {target_lons_array.max():.4f}]")
+            
+            # Use transformed coordinates for interpolation
+            target_lats = target_lats_array
+            target_lons = target_lons_array
+        else:
+            # No transformation needed - coordinates are already in lat/lon
+            # Extract target lat/lon grids
+            target_lats = target_coords['y']  # Assuming 'y' is latitude
+            target_lons = target_coords['x']  # Assuming 'x' is longitude
+            
+            # Handle different coordinate types (numpy arrays vs xarray DataArrays)
+            if hasattr(target_lats, 'values'):
+                target_lats_array = target_lats.values
+            else:
+                target_lats_array = np.array(target_lats)
+                
+            if hasattr(target_lons, 'values'):
+                target_lons_array = target_lons.values
+            else:
+                target_lons_array = np.array(target_lons)
 
         logger.debug(f"Target coordinates - lat shape: {target_lats_array.shape}, lon shape: {target_lons_array.shape}")
 
@@ -263,11 +370,12 @@ class DynamicWeatherFetcher:
                         method='nearest'
                     ).reshape(target_shape)
 
-                # Create DataArray
+                # Create DataArray with ORIGINAL coordinates (projected, matching Landsat data)
+                # NOT the transformed WGS84 coordinates used for interpolation
                 result[var] = xr.DataArray(
                     interpolated_2d,
                     dims=['y', 'x'],
-                    coords={'y': target_lats, 'x': target_lons},
+                    coords={'y': original_y_coords, 'x': original_x_coords},
                     name=var
                 )
                 
